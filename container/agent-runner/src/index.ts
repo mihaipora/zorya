@@ -31,7 +31,7 @@ interface ContainerInput {
 }
 
 interface ContainerOutput {
-  status: 'success' | 'error';
+  status: 'success' | 'error' | 'progress';
   result: string | null;
   newSessionId?: string;
   error?: string;
@@ -116,6 +116,50 @@ function writeOutput(output: ContainerOutput): void {
 
 function log(message: string): void {
   console.error(`[agent-runner] ${message}`);
+}
+
+function formatToolProgress(name: string, input: Record<string, unknown>): string {
+  // Handle MCP tool names like mcp__nanoclaw__foo
+  if (name.startsWith('mcp__')) {
+    const parts = name.split('__');
+    return `Using ${parts[parts.length - 1]}`;
+  }
+
+  switch (name) {
+    case 'Bash': {
+      const cmd = String(input.command || '').split('\n')[0].slice(0, 120);
+      const desc = input.description ? String(input.description) : '';
+      return desc ? `$ ${desc}` : `$ \`${cmd}\``;
+    }
+    case 'Read':
+      return `Reading \`${basename(String(input.file_path || ''))}\``;
+    case 'Write':
+      return `Writing \`${basename(String(input.file_path || ''))}\``;
+    case 'Edit':
+      return `Editing \`${basename(String(input.file_path || ''))}\``;
+    case 'Glob':
+      return `Searching files: \`${input.pattern || ''}\``;
+    case 'Grep':
+      return `Searching code: \`${input.pattern || ''}\``;
+    case 'WebSearch':
+      return `Searching the web: "${input.query || ''}"`;
+    case 'WebFetch':
+      return `Fetching: ${String(input.url || '').slice(0, 100)}`;
+    case 'Task':
+      return `Subtask: ${input.description || 'running'}`;
+    case 'Skill':
+      return `Running /${input.skill || 'skill'}`;
+    case 'TeamCreate':
+      return 'Creating agent team';
+    case 'SendMessage':
+      return 'Sending message';
+    default:
+      return `Using ${name}`;
+  }
+}
+
+function basename(filePath: string): string {
+  return filePath.split('/').pop() || filePath;
 }
 
 function getSessionSummary(sessionId: string, transcriptPath: string): string | null {
@@ -417,6 +461,7 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
+      model: process.env.CLAUDE_MODEL || 'claude-sonnet-4-6',
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -459,8 +504,28 @@ async function runQuery(
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
 
-    if (message.type === 'assistant' && 'uuid' in message) {
-      lastAssistantUuid = (message as { uuid: string }).uuid;
+    if (message.type === 'assistant') {
+      if ('uuid' in message) {
+        lastAssistantUuid = (message as { uuid: string }).uuid;
+      }
+
+      // Stream progress updates for tool use and intermediate text
+      const msg = message as { message?: { content?: Array<{ type: string; text?: string; name?: string; input?: Record<string, unknown> }> } };
+      const content = msg.message?.content;
+      if (content && content.length > 0) {
+        const toolUses = content.filter(c => c.type === 'tool_use');
+        const textParts = content.filter(c => c.type === 'text' && c.text?.trim());
+
+        for (const tool of toolUses) {
+          const label = formatToolProgress(tool.name || 'unknown', tool.input || {});
+          writeOutput({ status: 'progress', result: `_${label}_` });
+        }
+        for (const part of textParts) {
+          if (part.text) {
+            writeOutput({ status: 'progress', result: part.text });
+          }
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -528,6 +593,17 @@ async function main(): Promise<void> {
   let prompt = containerInput.prompt;
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+  } else {
+    // Inject behavior reminder into every user prompt so it's fresh even on session resume
+    const behaviorReminder = [
+      '[REMINDER: If this is a task (not a simple question), you MUST first use mcp__nanoclaw__send_message to send a SINGLE message that includes:',
+      '1) What you understood the user wants',
+      '2) Your specific action plan — what steps you will take, in order (e.g. "I\'ll search Google Maps first, then check reviews on each place, and compare ratings")',
+      'Example: "Looking for craft beer near Kobierzyńska! Here\'s my plan: I\'ll search Google Maps for craft beer bars in the area, check ratings and reviews for each one, then give you a ranked list with what makes each spot worth visiting."',
+      'Then start working. Send progress updates via send_message every few steps.',
+      'For simple questions or follow-ups to an ongoing conversation, just answer directly.]',
+    ].join('\n');
+    prompt = `${behaviorReminder}\n\n${prompt}`;
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {

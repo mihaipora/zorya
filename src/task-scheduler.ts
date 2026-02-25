@@ -138,6 +138,10 @@ async function runTask(
       },
       (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {
+        // Skip progress updates — only send final results to avoid duplicates.
+        // The agent emits text as both 'progress' (streaming) and 'success' (final).
+        if (streamedOutput.status === 'progress') return;
+
         if (streamedOutput.result) {
           result = streamedOutput.result;
           // Forward result to user (sendMessage handles formatting)

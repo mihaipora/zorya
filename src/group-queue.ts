@@ -23,7 +23,16 @@ interface GroupState {
   process: ChildProcess | null;
   containerName: string | null;
   groupFolder: string | null;
+  promptSnippet: string | null;
   retryCount: number;
+}
+
+export interface QueueStatus {
+  activeCount: number;
+  maxConcurrent: number;
+  activeGroups: { jid: string; isTask: boolean; idle: boolean; promptSnippet: string | null }[];
+  waitingCount: number;
+  pendingTaskCount: number;
 }
 
 export class GroupQueue {
@@ -46,6 +55,7 @@ export class GroupQueue {
         process: null,
         containerName: null,
         groupFolder: null,
+        promptSnippet: null,
         retryCount: 0,
       };
       this.groups.set(groupJid, state);
@@ -123,11 +133,12 @@ export class GroupQueue {
     );
   }
 
-  registerProcess(groupJid: string, proc: ChildProcess, containerName: string, groupFolder?: string): void {
+  registerProcess(groupJid: string, proc: ChildProcess, containerName: string, groupFolder?: string, promptSnippet?: string): void {
     const state = this.getGroup(groupJid);
     state.process = proc;
     state.containerName = containerName;
     if (groupFolder) state.groupFolder = groupFolder;
+    if (promptSnippet) state.promptSnippet = promptSnippet;
   }
 
   /**
@@ -214,6 +225,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.promptSnippet = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -241,6 +253,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.promptSnippet = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -316,6 +329,31 @@ export class GroupQueue {
       }
       // If neither pending, skip this group
     }
+  }
+
+  getStatus(): QueueStatus {
+    const activeGroups: QueueStatus['activeGroups'] = [];
+    let pendingTaskCount = 0;
+
+    for (const [jid, state] of this.groups) {
+      if (state.active) {
+        activeGroups.push({
+          jid,
+          isTask: state.isTaskContainer,
+          idle: state.idleWaiting,
+          promptSnippet: state.promptSnippet,
+        });
+      }
+      pendingTaskCount += state.pendingTasks.length;
+    }
+
+    return {
+      activeCount: this.activeCount,
+      maxConcurrent: MAX_CONCURRENT_CONTAINERS,
+      activeGroups,
+      waitingCount: this.waitingGroups.length,
+      pendingTaskCount,
+    };
   }
 
   async shutdown(_gracePeriodMs: number): Promise<void> {
