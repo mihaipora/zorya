@@ -1,0 +1,279 @@
+#!/usr/bin/env node
+'use strict';
+
+const http = require('http');
+
+// --- Config ---
+
+const DEFAULT_PORT = 8081;
+const HOSTS = ['host.docker.internal', '172.17.0.1'];
+
+// --- Helpers ---
+
+function die(msg) {
+  process.stderr.write(`Error: ${msg}\n`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--json') {
+      args.json = true;
+    } else if (arg === '--limit' && i + 1 < argv.length) {
+      args.limit = parseInt(argv[++i], 10);
+    } else if (arg === '--days' && i + 1 < argv.length) {
+      args.days = parseInt(argv[++i], 10);
+    } else if (!arg.startsWith('--')) {
+      args._.push(arg);
+    } else {
+      die(`Unknown flag: ${arg}`);
+    }
+  }
+  return args;
+}
+
+function httpGet(host, port, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: host, port, path, method: 'GET', timeout: 10000 },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+    req.end();
+  });
+}
+
+async function resolveHost() {
+  // Override via env var
+  const envHost = process.env.MTPROTO_READER_HOST;
+  if (envHost) {
+    const [host, portStr] = envHost.includes(':') ? envHost.split(':') : [envHost, String(DEFAULT_PORT)];
+    return { host, port: parseInt(portStr, 10) || DEFAULT_PORT };
+  }
+
+  // Try each host
+  for (const host of HOSTS) {
+    try {
+      await httpGet(host, DEFAULT_PORT, '/health');
+      return { host, port: DEFAULT_PORT };
+    } catch {
+      // Try next host
+    }
+  }
+
+  die('MTProto reader is not running. Start it on the host:\n  node dist/mtproto-reader.js');
+}
+
+async function request(apiPath) {
+  const { host, port } = await resolveHost();
+  const res = await httpGet(host, port, apiPath);
+
+  if (res.status === 503) {
+    die('MTProto reader is not connected to Telegram. Check the server logs.');
+  }
+
+  if (res.status === 404) {
+    const data = JSON.parse(res.body);
+    die(data.error || 'Not found');
+  }
+
+  if (res.status === 400) {
+    const data = JSON.parse(res.body);
+    die(data.error || 'Bad request');
+  }
+
+  if (res.status !== 200) {
+    die(`Unexpected response (${res.status}): ${res.body}`);
+  }
+
+  return JSON.parse(res.body);
+}
+
+// --- Formatters ---
+
+function formatDate(isoStr) {
+  const d = new Date(isoStr);
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${months[d.getMonth()]} ${d.getDate()}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatTime(isoStr) {
+  const d = new Date(isoStr);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function formatPending(chats) {
+  if (chats.length === 0) {
+    process.stdout.write('No pending replies.\n');
+    return;
+  }
+
+  const lines = [];
+  for (const chat of chats) {
+    lines.push(`${chat.chatName} (${chat.chatType}) — ${chat.unreadCount} unread  [chatId: ${chat.chatId}]`);
+    if (chat.lastMessage.text) {
+      lines.push(`  "${chat.lastMessage.text}"`);
+    }
+    if (chat.lastMessage.date) {
+      lines.push(`  ${formatDate(chat.lastMessage.date)}`);
+    }
+    lines.push('---');
+  }
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+function formatConversation(data) {
+  const lines = [];
+  lines.push(`Chat: ${data.chatName}`);
+  lines.push('');
+
+  for (const msg of data.messages) {
+    const time = formatTime(msg.date);
+    lines.push(`[${time}] ${msg.sender}:`);
+    lines.push(`  ${msg.text}`);
+    lines.push('');
+  }
+
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+function formatHealth(data) {
+  process.stdout.write(`Status: ${data.status}\n`);
+  process.stdout.write(`Connected: ${data.connected}\n`);
+  process.stdout.write(`User: ${data.user}\n`);
+}
+
+function formatConversations(chats) {
+  if (chats.length === 0) {
+    process.stdout.write('No conversations in this period.\n');
+    return;
+  }
+
+  const lines = [];
+  for (const chat of chats) {
+    const fromMe = chat.lastMessageIsFromMe ? ' (you replied)' : '';
+    const unread = chat.unreadCount > 0 ? ` — ${chat.unreadCount} unread` : '';
+    lines.push(`${chat.chatName} (${chat.chatType})${unread}${fromMe}  [chatId: ${chat.chatId}]`);
+    if (chat.lastMessage.text) {
+      const preview = chat.lastMessage.text.length > 120
+        ? chat.lastMessage.text.slice(0, 120) + '...'
+        : chat.lastMessage.text;
+      lines.push(`  ${chat.lastMessage.sender}: "${preview}"`);
+    }
+    if (chat.lastMessage.date) {
+      lines.push(`  ${formatDate(chat.lastMessage.date)}`);
+    }
+    lines.push('---');
+  }
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+// --- Commands ---
+
+async function cmdConversations(args) {
+  const days = args.days || 7;
+  const limit = args.limit || 50;
+  const data = await request(`/conversations?days=${days}&limit=${limit}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatConversations(data);
+  }
+}
+
+async function cmdPending(args) {
+  const limit = args.limit || 20;
+  const data = await request(`/pending-replies?limit=${limit}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatPending(data);
+  }
+}
+
+async function cmdConversation(args) {
+  const chatId = args._[1];
+  if (!chatId) die('Usage: telegram-reader conversation <chatId> [--limit N] [--json]');
+
+  const limit = args.limit || 20;
+  const data = await request(`/conversation/${chatId}?limit=${limit}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatConversation(data);
+  }
+}
+
+async function cmdHealth(args) {
+  const data = await request('/health');
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatHealth(data);
+  }
+}
+
+// --- Usage ---
+
+function printUsage() {
+  const usage = `Usage: telegram-reader <command> [options]
+
+Commands:
+  conversations               List recent conversations (default: last 7 days)
+  pending                     List chats awaiting your reply
+  conversation <chatId>       Read messages from a chat
+  health                      Check if the reader is running
+
+Flags:
+  --json       Output raw JSON instead of formatted text
+  --limit N    Max results (default: 20, conversations: 50)
+  --days N     Time window for conversations (default: 7, max: 30)
+`;
+  process.stderr.write(usage);
+  process.exit(1);
+}
+
+// --- Main ---
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const command = args._[0];
+
+  if (!command) printUsage();
+
+  switch (command) {
+    case 'conversations':
+      return cmdConversations(args);
+    case 'pending':
+      return cmdPending(args);
+    case 'conversation':
+      return cmdConversation(args);
+    case 'health':
+      return cmdHealth(args);
+    default:
+      die(`Unknown command: ${command}\nAvailable: conversations, pending, conversation, health`);
+  }
+}
+
+main().catch((err) => {
+  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+    die('MTProto reader is not running. Start it on the host:\n  node dist/mtproto-reader.js');
+  }
+  die(err.message || String(err));
+});
