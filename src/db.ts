@@ -5,7 +5,7 @@ import path from 'path';
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
+import { EventProposal, NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
 
 let db: Database.Database;
 
@@ -76,6 +76,22 @@ function createSchema(database: Database.Database): void {
       added_at TEXT NOT NULL,
       container_config TEXT,
       requires_trigger INTEGER DEFAULT 1
+    );
+
+    CREATE TABLE IF NOT EXISTS event_proposals (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      start_time TEXT NOT NULL,
+      end_time TEXT NOT NULL,
+      attendees TEXT DEFAULT '[]',
+      description TEXT DEFAULT '',
+      location TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending', 'approved', 'rejected', 'expired')),
+      telegram_message_id TEXT,
+      chat_jid TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
     );
   `);
 
@@ -598,6 +614,72 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Event proposal accessors ---
+
+export function createEventProposal(proposal: Omit<EventProposal, 'resolved_at' | 'telegram_message_id'>): void {
+  db.prepare(
+    `INSERT INTO event_proposals (id, title, start_time, end_time, attendees, description, location, status, chat_jid, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    proposal.id,
+    proposal.title,
+    proposal.start_time,
+    proposal.end_time,
+    JSON.stringify(proposal.attendees),
+    proposal.description,
+    proposal.location,
+    proposal.status,
+    proposal.chat_jid,
+    proposal.created_at,
+  );
+}
+
+export function getEventProposal(id: string): EventProposal | undefined {
+  const row = db.prepare('SELECT * FROM event_proposals WHERE id = ?').get(id) as
+    | (Omit<EventProposal, 'attendees'> & { attendees: string })
+    | undefined;
+  if (!row) return undefined;
+  return {
+    ...row,
+    attendees: JSON.parse(row.attendees),
+  };
+}
+
+export function updateEventProposal(
+  id: string,
+  updates: Partial<Pick<EventProposal, 'status' | 'telegram_message_id' | 'resolved_at'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.telegram_message_id !== undefined) {
+    fields.push('telegram_message_id = ?');
+    values.push(updates.telegram_message_id);
+  }
+  if (updates.resolved_at !== undefined) {
+    fields.push('resolved_at = ?');
+    values.push(updates.resolved_at);
+  }
+
+  if (fields.length === 0) return;
+
+  values.push(id);
+  db.prepare(
+    `UPDATE event_proposals SET ${fields.join(', ')} WHERE id = ?`,
+  ).run(...values);
+}
+
+export function expireStaleProposals(): void {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(
+    `UPDATE event_proposals SET status = 'expired', resolved_at = ? WHERE status = 'pending' AND created_at < ?`,
+  ).run(new Date().toISOString(), cutoff);
 }
 
 // --- JSON migration ---

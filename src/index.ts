@@ -12,6 +12,7 @@ import {
   TELEGRAM_ONLY,
   TRIGGER_PATTERN,
 } from './config.js';
+import { createCalendarEvent } from './calendar-approval.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import { TelegramChannel } from './channels/telegram.js';
 import {
@@ -22,10 +23,12 @@ import {
 } from './container-runner.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import {
+  expireStaleProposals,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
   getAllTasks,
+  getEventProposal,
   getMessagesSince,
   getNewMessages,
   getRouterState,
@@ -35,6 +38,7 @@ import {
   setSession,
   storeChatMetadata,
   storeMessage,
+  updateEventProposal,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
@@ -453,7 +457,56 @@ async function main(): Promise<void> {
   }
 
   if (TELEGRAM_BOT_TOKEN) {
-    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, channelOpts);
+    const telegram = new TelegramChannel(TELEGRAM_BOT_TOKEN, {
+      ...channelOpts,
+      onEventCallback: async (proposalId, action, ctx) => {
+        try {
+          const proposal = getEventProposal(proposalId);
+          if (!proposal || proposal.status !== 'pending') {
+            await ctx.answerCallbackQuery('This proposal has already been handled.');
+            return;
+          }
+
+          // Check expiry (24h)
+          const age = Date.now() - new Date(proposal.created_at).getTime();
+          if (age > 24 * 60 * 60 * 1000) {
+            updateEventProposal(proposalId, { status: 'expired', resolved_at: new Date().toISOString() });
+            await ctx.editMessageText('⏰ Proposal expired');
+            await ctx.answerCallbackQuery('Expired');
+            return;
+          }
+
+          if (action === 'approve') {
+            // Validate start time is still in the future
+            if (new Date(proposal.start_time).getTime() <= Date.now()) {
+              updateEventProposal(proposalId, { status: 'expired', resolved_at: new Date().toISOString() });
+              await ctx.editMessageText('⏰ Can\'t create — the start time has passed.');
+              await ctx.answerCallbackQuery('Start time has passed');
+              return;
+            }
+
+            try {
+              const result = await createCalendarEvent(proposal);
+              updateEventProposal(proposalId, { status: 'approved', resolved_at: new Date().toISOString() });
+              await ctx.editMessageText(`✅ Event created: ${proposal.title}\n${result.htmlLink || ''}`);
+              await ctx.answerCallbackQuery('Event created!');
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              logger.error({ proposalId, err }, 'Failed to create calendar event');
+              await ctx.editMessageText(`❌ Failed to create event: ${msg}`);
+              await ctx.answerCallbackQuery('Failed');
+            }
+          } else if (action === 'skip') {
+            updateEventProposal(proposalId, { status: 'rejected', resolved_at: new Date().toISOString() });
+            await ctx.editMessageText(`❌ Skipped: ${proposal.title}`);
+            await ctx.answerCallbackQuery('Skipped');
+          }
+        } catch (err) {
+          logger.error({ proposalId, err }, 'Error handling event callback');
+          try { await ctx.answerCallbackQuery('Error processing request'); } catch { /* ignore */ }
+        }
+      },
+    });
     channels.push(telegram);
     await telegram.connect();
   }
@@ -482,9 +535,18 @@ async function main(): Promise<void> {
     syncGroupMetadata: (force) => whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
+    sendEventProposal: async (jid, proposal) => {
+      const channel = findChannel(channels, jid);
+      if (!channel || !(channel instanceof TelegramChannel)) return undefined;
+      return channel.sendEventProposal(jid, proposal);
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Expire stale event proposals every hour
+  setInterval(() => expireStaleProposals(), 60 * 60 * 1000);
+
   startMessageLoop();
 }
 

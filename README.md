@@ -2,7 +2,7 @@
 
 Personal AI assistant on Telegram, powered by Claude Agent SDK running in Docker containers. Fork of [qwibitai/nanoclaw](https://github.com/qwibitai/nanoclaw).
 
-Bot name: **Dorel** (`@mihai_s_bot`)
+Bot name: **Zorya** (`@mihai_s_bot`)
 
 ## Setup
 

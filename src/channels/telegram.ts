@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Bot, InlineKeyboard } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { getAllTasks, getRouterState, setRouterState } from '../db.js';
@@ -6,6 +6,7 @@ import { logger } from '../logger.js';
 import type { QueueStatus } from '../group-queue.js';
 import {
   Channel,
+  EventProposal,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
@@ -16,6 +17,7 @@ export interface TelegramChannelOpts {
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
   getStatus?: () => QueueStatus;
+  onEventCallback?: (proposalId: string, action: string, ctx: any) => Promise<void>;
 }
 
 export class TelegramChannel implements Channel {
@@ -113,6 +115,17 @@ export class TelegramChannel implements Channel {
       }
 
       ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
+    });
+
+    // Handle inline keyboard callbacks (event proposals, etc.)
+    this.bot.on('callback_query:data', async (ctx) => {
+      const data = ctx.callbackQuery.data;
+      if (!data?.startsWith('event:')) return;
+
+      const [, action, proposalId] = data.split(':');
+      if (this.opts.onEventCallback) {
+        await this.opts.onEventCallback(proposalId, action, ctx);
+      }
     });
 
     this.bot.on('message:text', async (ctx) => {
@@ -250,6 +263,54 @@ export class TelegramChannel implements Channel {
         },
       });
     });
+  }
+
+  async sendEventProposal(jid: string, proposal: EventProposal): Promise<string | undefined> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return undefined;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+
+      const startDate = new Date(proposal.start_time);
+      const endDate = new Date(proposal.end_time);
+      const dateStr = startDate.toLocaleDateString('en-GB', {
+        weekday: 'short', day: 'numeric', month: 'short',
+      });
+      const startStr = startDate.toLocaleTimeString('en-GB', {
+        hour: '2-digit', minute: '2-digit',
+      });
+      const endStr = endDate.toLocaleTimeString('en-GB', {
+        hour: '2-digit', minute: '2-digit',
+      });
+
+      let text = `📅 *${proposal.title}*\n${dateStr}, ${startStr} – ${endStr}`;
+      if (proposal.attendees.length > 0) {
+        text += `\nAttendees: ${proposal.attendees.join(', ')}`;
+      }
+      if (proposal.location) {
+        text += `\nLocation: ${proposal.location}`;
+      }
+      if (proposal.description) {
+        text += `\n\n${proposal.description}`;
+      }
+
+      const keyboard = new InlineKeyboard()
+        .text('✅ Create', `event:approve:${proposal.id}`)
+        .text('❌ Skip', `event:skip:${proposal.id}`);
+
+      const msg = await this.bot.api.sendMessage(numericId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+
+      return msg.message_id.toString();
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send event proposal');
+      return undefined;
+    }
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {

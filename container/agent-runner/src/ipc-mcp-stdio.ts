@@ -280,6 +280,53 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
+server.tool(
+  'propose_event',
+  `Propose a calendar event for user approval. The user will see an inline keyboard in Telegram with Create/Skip buttons. You cannot create events directly — use this tool and the user will approve or skip. Include all relevant details: title, start/end times, attendees, and description.`,
+  {
+    title: z.string().describe('Event title'),
+    startTime: z.string().describe('Start time as ISO 8601 local datetime (e.g., "2026-02-27T14:00:00")'),
+    endTime: z.string().describe('End time as ISO 8601 local datetime (e.g., "2026-02-27T15:00:00")'),
+    attendees: z.array(z.string()).optional().describe('Email addresses to invite'),
+    description: z.string().optional().describe('Event description'),
+    location: z.string().optional().describe('Event location'),
+  },
+  async (args) => {
+    // Basic validation
+    const start = new Date(args.startTime);
+    const end = new Date(args.endTime);
+    if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+      return {
+        content: [{ type: 'text' as const, text: 'Invalid date format. Use ISO 8601 local datetime like "2026-02-27T14:00:00".' }],
+        isError: true,
+      };
+    }
+    if (start >= end) {
+      return {
+        content: [{ type: 'text' as const, text: 'Start time must be before end time.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'event_proposal',
+      chatJid,
+      groupFolder,
+      title: args.title,
+      startTime: args.startTime,
+      endTime: args.endTime,
+      attendees: args.attendees || [],
+      description: args.description || '',
+      location: args.location || '',
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Event proposal sent: "${args.title}"` }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

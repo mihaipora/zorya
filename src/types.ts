@@ -67,6 +67,21 @@ export interface ScheduledTask {
   created_at: string;
 }
 
+export interface EventProposal {
+  id: string;
+  title: string;
+  start_time: string;
+  end_time: string;
+  attendees: string[];
+  description: string;
+  location: string;
+  status: 'pending' | 'approved' | 'rejected' | 'expired';
+  telegram_message_id: string | null;
+  chat_jid: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 export interface TaskRunLog {
   task_id: string;
   run_at: string;

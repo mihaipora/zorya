@@ -10,10 +10,10 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
+import { createEventProposal, createTask, deleteTask, getTaskById, updateEventProposal, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { EventProposal, RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -27,6 +27,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  sendEventProposal?: (jid: string, proposal: EventProposal) => Promise<string | undefined>;
 }
 
 let ipcWatcherRunning = false;
@@ -89,6 +90,65 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
                   );
+                }
+              } else if (data.type === 'event_proposal' && data.chatJid) {
+                // Validate proposal fields
+                if (!data.title?.trim()) {
+                  logger.warn({ sourceGroup }, 'Event proposal missing title');
+                } else {
+                  const start = new Date(data.startTime);
+                  const end = new Date(data.endTime);
+
+                  if (isNaN(start.getTime()) || isNaN(end.getTime())) {
+                    logger.warn({ sourceGroup }, 'Event proposal has invalid dates');
+                  } else if (start >= end) {
+                    logger.warn({ sourceGroup }, 'Event proposal start must be before end');
+                  } else if (start.getTime() <= Date.now()) {
+                    logger.warn({ sourceGroup }, 'Event proposal start must be in the future');
+                  } else {
+                    // Authorization check
+                    const targetGroup = registeredGroups[data.chatJid];
+                    if (
+                      isMain ||
+                      (targetGroup && targetGroup.folder === sourceGroup)
+                    ) {
+                      const proposalId = `prop-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+                      const attendees = Array.isArray(data.attendees) ? data.attendees : [];
+                      const proposal: EventProposal = {
+                        id: proposalId,
+                        title: data.title.trim(),
+                        start_time: data.startTime,
+                        end_time: data.endTime,
+                        attendees,
+                        description: data.description || '',
+                        location: data.location || '',
+                        status: 'pending',
+                        telegram_message_id: null,
+                        chat_jid: data.chatJid,
+                        created_at: new Date().toISOString(),
+                        resolved_at: null,
+                      };
+
+                      createEventProposal(proposal);
+
+                      if (deps.sendEventProposal) {
+                        const msgId = await deps.sendEventProposal(data.chatJid, proposal);
+                        if (msgId) {
+                          updateEventProposal(proposalId, { telegram_message_id: msgId });
+                        }
+                      }
+
+                      logger.info(
+                        { proposalId, chatJid: data.chatJid, sourceGroup },
+                        'Event proposal created',
+                      );
+                    } else {
+                      logger.warn(
+                        { chatJid: data.chatJid, sourceGroup },
+                        'Unauthorized event proposal attempt blocked',
+                      );
+                    }
+                  }
                 }
               }
               fs.unlinkSync(filePath);
