@@ -445,12 +445,18 @@ async function runQuery(
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
+  const extraClaudeMds: string[] = [];
   const extraBase = '/workspace/extra';
   if (fs.existsSync(extraBase)) {
     for (const entry of fs.readdirSync(extraBase)) {
       const fullPath = path.join(extraBase, entry);
       if (fs.statSync(fullPath).isDirectory()) {
         extraDirs.push(fullPath);
+        const claudeMdPath = path.join(fullPath, 'CLAUDE.md');
+        if (fs.existsSync(claudeMdPath)) {
+          extraClaudeMds.push(fs.readFileSync(claudeMdPath, 'utf-8'));
+          log(`Loaded CLAUDE.md from ${claudeMdPath}`);
+        }
       }
     }
   }
@@ -466,8 +472,8 @@ async function runQuery(
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
-        ? { type: 'preset' as const, preset: 'claude_code' as const, append: globalClaudeMd }
+      systemPrompt: (globalClaudeMd || extraClaudeMds.length > 0)
+        ? { type: 'preset' as const, preset: 'claude_code' as const, append: [globalClaudeMd, ...extraClaudeMds].filter(Boolean).join('\n\n') }
         : undefined,
       allowedTools: [
         'Bash',

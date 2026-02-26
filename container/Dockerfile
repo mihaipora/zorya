@@ -58,6 +58,10 @@ RUN printf '#!/bin/bash\nset -e\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace && chmod 777 /home/node
 
+# Copy CLI tools
+COPY tools/google-api /usr/local/bin/google-api
+RUN chmod +x /usr/local/bin/google-api
+
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 

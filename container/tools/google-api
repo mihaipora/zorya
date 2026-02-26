@@ -1,0 +1,765 @@
+#!/usr/bin/env node
+'use strict';
+
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+
+// --- Config ---
+
+const OAUTH_PATH = '/workspace/extra/google-oauth/oauth.json';
+const CACHE_PATH = '/tmp/google-api-cache.json';
+const TOKEN_ENDPOINT_HOST = 'oauth2.googleapis.com';
+const TOKEN_ENDPOINT_PATH = '/token';
+const GMAIL_HOST = 'gmail.googleapis.com';
+const CALENDAR_HOST = 'www.googleapis.com';
+const EXPIRY_BUFFER_MS = 5 * 60 * 1000; // 5 minutes
+
+// --- Helpers ---
+
+function die(msg) {
+  process.stderr.write(`Error: ${msg}\n`);
+  process.exit(1);
+}
+
+function warn(msg) {
+  process.stderr.write(`Warning: ${msg}\n`);
+}
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--json') {
+      args.json = true;
+    } else if (arg === '--limit' && i + 1 < argv.length) {
+      args.limit = parseInt(argv[++i], 10);
+    } else if (arg === '--query' && i + 1 < argv.length) {
+      args.query = argv[++i];
+    } else if (arg === '--days' && i + 1 < argv.length) {
+      args.days = parseInt(argv[++i], 10);
+    } else if (arg === '--from' && i + 1 < argv.length) {
+      args.from = argv[++i];
+    } else if (!arg.startsWith('--')) {
+      args._.push(arg);
+    } else {
+      die(`Unknown flag: ${arg}`);
+    }
+  }
+  return args;
+}
+
+function httpsRequest(options, postBody) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => (data += chunk));
+      res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    if (postBody) req.write(postBody);
+    req.end();
+  });
+}
+
+function apiGet(host, apiPath, accessToken) {
+  return httpsRequest({
+    hostname: host,
+    path: apiPath,
+    method: 'GET',
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+}
+
+function handleApiError(res, context) {
+  if (res.status === 429) {
+    die(`Rate limited by Google API (${context}). Try again in a moment.`);
+  }
+  if (res.status === 401) {
+    die(`Authentication failed (${context}). Token may be revoked. Re-run: npx tsx scripts/google-oauth.ts`);
+  }
+  let detail = '';
+  try {
+    const parsed = JSON.parse(res.body);
+    detail = parsed.error?.message || parsed.error_description || res.body;
+  } catch {
+    detail = res.body;
+  }
+  die(`API error ${res.status} (${context}): ${detail}`);
+}
+
+// --- Auth ---
+
+function loadCredentials() {
+  if (!fs.existsSync(OAUTH_PATH)) {
+    die(`Google OAuth credentials not found at ${OAUTH_PATH}\nRun the setup script: npx tsx scripts/google-oauth.ts`);
+  }
+  return JSON.parse(fs.readFileSync(OAUTH_PATH, 'utf-8'));
+}
+
+function loadCache() {
+  try {
+    return JSON.parse(fs.readFileSync(CACHE_PATH, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+function saveCache(data) {
+  try {
+    fs.writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2));
+  } catch (e) {
+    warn(`Could not write token cache: ${e.message}`);
+  }
+}
+
+async function refreshToken(clientId, clientSecret, refreshToken) {
+  const body = new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    refresh_token: refreshToken,
+    grant_type: 'refresh_token',
+  }).toString();
+
+  const res = await httpsRequest(
+    {
+      hostname: TOKEN_ENDPOINT_HOST,
+      path: TOKEN_ENDPOINT_PATH,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    },
+    body,
+  );
+
+  if (res.status !== 200) {
+    let detail = '';
+    try {
+      const parsed = JSON.parse(res.body);
+      detail = parsed.error_description || parsed.error || res.body;
+    } catch {
+      detail = res.body;
+    }
+    die(`Token refresh failed: ${detail}\nRe-run: npx tsx scripts/google-oauth.ts`);
+  }
+
+  const data = JSON.parse(res.body);
+  return {
+    access_token: data.access_token,
+    token_expiry: new Date(Date.now() + data.expires_in * 1000).toISOString(),
+  };
+}
+
+async function getAccessToken() {
+  const creds = loadCredentials();
+  const cache = loadCache();
+
+  // Check cache first
+  if (cache && cache.access_token && cache.token_expiry) {
+    const expiry = new Date(cache.token_expiry).getTime();
+    if (Date.now() < expiry - EXPIRY_BUFFER_MS) {
+      return cache.access_token;
+    }
+  }
+
+  // Check credentials file token
+  if (creds.access_token && creds.token_expiry) {
+    const expiry = new Date(creds.token_expiry).getTime();
+    if (Date.now() < expiry - EXPIRY_BUFFER_MS) {
+      return creds.access_token;
+    }
+  }
+
+  // Refresh
+  const fresh = await refreshToken(creds.client_id, creds.client_secret, creds.refresh_token);
+  saveCache(fresh);
+  return fresh.access_token;
+}
+
+// --- Base64url ---
+
+function decodeBase64Url(str) {
+  if (!str) return '';
+  const padded = str.replace(/-/g, '+').replace(/_/g, '/');
+  return Buffer.from(padded, 'base64').toString('utf-8');
+}
+
+// --- MIME body extraction ---
+
+function extractBody(payload) {
+  if (!payload) return '';
+
+  // Single part with body data
+  if (payload.body && payload.body.data) {
+    const mimeType = (payload.mimeType || '').toLowerCase();
+    if (mimeType === 'text/plain') {
+      return decodeBase64Url(payload.body.data);
+    }
+    if (mimeType === 'text/html') {
+      return stripHtml(decodeBase64Url(payload.body.data));
+    }
+    return decodeBase64Url(payload.body.data);
+  }
+
+  // Multipart — walk children
+  if (payload.parts && payload.parts.length > 0) {
+    // Prefer text/plain
+    const plainPart = findPart(payload.parts, 'text/plain');
+    if (plainPart) return decodeBase64Url(plainPart.body.data);
+
+    // Fall back to text/html
+    const htmlPart = findPart(payload.parts, 'text/html');
+    if (htmlPart) return stripHtml(decodeBase64Url(htmlPart.body.data));
+
+    // Recurse into nested multipart
+    for (const part of payload.parts) {
+      const body = extractBody(part);
+      if (body) return body;
+    }
+  }
+
+  return '';
+}
+
+function findPart(parts, mimeType) {
+  for (const part of parts) {
+    if ((part.mimeType || '').toLowerCase() === mimeType && part.body && part.body.data) {
+      return part;
+    }
+    // Recurse into nested multipart
+    if (part.parts) {
+      const found = findPart(part.parts, mimeType);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function stripHtml(html) {
+  return html
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<\/li>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+// --- Gmail helpers ---
+
+function getHeader(headers, name) {
+  if (!headers) return '';
+  const h = headers.find((h) => h.name.toLowerCase() === name.toLowerCase());
+  return h ? h.value : '';
+}
+
+function formatDate(dateStr) {
+  if (!dateStr) return '';
+  const d = new Date(dateStr);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// --- Gmail commands ---
+
+async function gmailList(args) {
+  const token = await getAccessToken();
+  const limit = Math.min(Math.max(args.limit || 10, 1), 50);
+
+  let query = args.query || '';
+  if (args.days) {
+    const d = new Date();
+    d.setDate(d.getDate() - args.days);
+    const dateStr = `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
+    query = `after:${dateStr}${query ? ' ' + query : ''}`;
+  }
+
+  const params = new URLSearchParams({ maxResults: String(limit) });
+  if (query) params.set('q', query);
+
+  const res = await apiGet(GMAIL_HOST, `/gmail/v1/users/me/threads?${params}`, token);
+  if (res.status !== 200) handleApiError(res, 'gmail list threads');
+
+  const data = JSON.parse(res.body);
+  const threads = data.threads || [];
+
+  if (threads.length === 0) {
+    if (args.json) {
+      process.stdout.write('[]\n');
+    } else {
+      process.stdout.write('No messages found.\n');
+    }
+    return;
+  }
+
+  // Fetch thread metadata concurrently (5 at a time)
+  const detailed = [];
+  for (let i = 0; i < threads.length; i += 5) {
+    const batch = threads.slice(i, i + 5);
+    const results = await Promise.all(
+      batch.map((t) =>
+        apiGet(GMAIL_HOST, `/gmail/v1/users/me/threads/${t.id}?format=METADATA&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`, token),
+      ),
+    );
+    for (const r of results) {
+      if (r.status === 200) {
+        detailed.push(JSON.parse(r.body));
+      }
+    }
+  }
+
+  if (args.json) {
+    const output = detailed.map((t) => {
+      const lastMsg = t.messages[t.messages.length - 1];
+      return {
+        threadId: t.id,
+        from: getHeader(lastMsg.payload.headers, 'From'),
+        subject: getHeader(lastMsg.payload.headers, 'Subject'),
+        date: getHeader(lastMsg.payload.headers, 'Date'),
+        snippet: lastMsg.snippet,
+        messageCount: t.messages.length,
+      };
+    });
+    process.stdout.write(JSON.stringify(output, null, 2) + '\n');
+    return;
+  }
+
+  // Plain text
+  const lines = [];
+  for (const t of detailed) {
+    const lastMsg = t.messages[t.messages.length - 1];
+    const from = getHeader(lastMsg.payload.headers, 'From');
+    const subject = getHeader(lastMsg.payload.headers, 'Subject');
+    const date = getHeader(lastMsg.payload.headers, 'Date');
+    lines.push(`Thread: ${t.id} (${t.messages.length} message${t.messages.length > 1 ? 's' : ''})`);
+    lines.push(`From: ${from}`);
+    lines.push(`Date: ${formatDate(date)}`);
+    lines.push(`Subject: ${subject}`);
+    lines.push(`Snippet: ${lastMsg.snippet}`);
+    lines.push('---');
+  }
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+async function gmailRead(args) {
+  const id = args._[2];
+  if (!id) die('Usage: google-api gmail read <thread-id-or-message-id>');
+
+  const token = await getAccessToken();
+
+  // Try as thread first
+  let res = await apiGet(GMAIL_HOST, `/gmail/v1/users/me/threads/${id}?format=FULL`, token);
+
+  if (res.status === 404) {
+    // Try as message ID → get threadId
+    const msgRes = await apiGet(GMAIL_HOST, `/gmail/v1/users/me/messages/${id}?format=MINIMAL`, token);
+    if (msgRes.status === 404) {
+      die(`Not found: ${id} is not a valid thread ID or message ID`);
+    }
+    if (msgRes.status !== 200) handleApiError(msgRes, 'gmail get message');
+
+    const msg = JSON.parse(msgRes.body);
+    res = await apiGet(GMAIL_HOST, `/gmail/v1/users/me/threads/${msg.threadId}?format=FULL`, token);
+  }
+
+  if (res.status !== 200) handleApiError(res, 'gmail read thread');
+
+  const thread = JSON.parse(res.body);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(thread, null, 2) + '\n');
+    return;
+  }
+
+  // Plain text
+  const lines = [];
+  lines.push(`Thread: ${thread.id}`);
+  lines.push(`Messages: ${thread.messages.length}`);
+  lines.push('');
+
+  for (let i = 0; i < thread.messages.length; i++) {
+    const msg = thread.messages[i];
+    const headers = msg.payload.headers || [];
+    const from = getHeader(headers, 'From');
+    const date = getHeader(headers, 'Date');
+    const subject = getHeader(headers, 'Subject');
+    const body = extractBody(msg.payload);
+
+    lines.push(`[${i + 1}] From: ${from}`);
+    lines.push(`    Date: ${formatDate(date)}`);
+    if (subject && i === 0) {
+      lines.push(`    Subject: ${subject}`);
+    }
+    lines.push('');
+    // Indent body
+    const bodyLines = body.split('\n').map((l) => '    ' + l);
+    lines.push(bodyLines.join('\n'));
+    lines.push('');
+  }
+
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+async function gmailLabels(args) {
+  const token = await getAccessToken();
+  const res = await apiGet(GMAIL_HOST, '/gmail/v1/users/me/labels', token);
+  if (res.status !== 200) handleApiError(res, 'gmail labels');
+
+  const data = JSON.parse(res.body);
+  const labels = (data.labels || []).sort((a, b) => a.name.localeCompare(b.name));
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(labels, null, 2) + '\n');
+    return;
+  }
+
+  if (labels.length === 0) {
+    process.stdout.write('No labels found.\n');
+    return;
+  }
+
+  for (const label of labels) {
+    process.stdout.write(`${label.name} (${label.id})\n`);
+  }
+}
+
+// --- Calendar commands ---
+
+async function calendarList(args) {
+  const token = await getAccessToken();
+  const days = args.days || 7;
+
+  let fromDate;
+  if (args.from) {
+    fromDate = new Date(args.from + 'T00:00:00');
+    if (isNaN(fromDate.getTime())) die(`Invalid date: ${args.from}`);
+  } else {
+    fromDate = new Date();
+    fromDate.setHours(0, 0, 0, 0);
+  }
+
+  const toDate = new Date(fromDate);
+  toDate.setDate(toDate.getDate() + days);
+  toDate.setHours(23, 59, 59, 999);
+
+  const timeMin = fromDate.toISOString();
+  const timeMax = toDate.toISOString();
+
+  // Try calendarList first (requires calendar.readonly scope), fall back to primary only
+  let calendars = [];
+  const calRes = await apiGet(CALENDAR_HOST, '/calendar/v3/users/me/calendarList', token);
+  if (calRes.status === 200) {
+    calendars = JSON.parse(calRes.body).items || [];
+  } else if (calRes.status === 403) {
+    // calendar.events scope doesn't cover calendarList — use primary calendar only
+    calendars = [{ id: 'primary', summary: 'Primary' }];
+  } else {
+    handleApiError(calRes, 'calendar list');
+  }
+
+  // Fetch events from all calendars concurrently (5 at a time)
+  const allEvents = [];
+  const calBatches = [];
+  for (let i = 0; i < calendars.length; i += 5) {
+    calBatches.push(calendars.slice(i, i + 5));
+  }
+
+  for (const batch of calBatches) {
+    const results = await Promise.all(
+      batch.map((cal) => {
+        const params = new URLSearchParams({
+          timeMin,
+          timeMax,
+          singleEvents: 'true',
+          orderBy: 'startTime',
+          maxResults: '250',
+        });
+        return apiGet(
+          CALENDAR_HOST,
+          `/calendar/v3/calendars/${encodeURIComponent(cal.id)}/events?${params}`,
+          token,
+        ).then((res) => ({ cal, res }));
+      }),
+    );
+
+    for (const { cal, res } of results) {
+      if (res.status === 200) {
+        const data = JSON.parse(res.body);
+        const calName = cal.summary || data.summary || cal.id;
+        const events = data.items || [];
+        for (const evt of events) {
+          evt._calendarName = calName;
+        }
+        allEvents.push(...events);
+      }
+    }
+  }
+
+  // Sort by start time
+  allEvents.sort((a, b) => {
+    const aStart = a.start.dateTime || a.start.date || '';
+    const bStart = b.start.dateTime || b.start.date || '';
+    return aStart.localeCompare(bStart);
+  });
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(allEvents, null, 2) + '\n');
+    return;
+  }
+
+  if (allEvents.length === 0) {
+    process.stdout.write('No events in this period.\n');
+    return;
+  }
+
+  // Group by day
+  const dayGroups = new Map();
+  for (const evt of allEvents) {
+    let dayKey;
+    if (evt.start.date) {
+      // All-day event
+      dayKey = evt.start.date;
+    } else {
+      dayKey = evt.start.dateTime.split('T')[0];
+    }
+    if (!dayGroups.has(dayKey)) dayGroups.set(dayKey, []);
+    dayGroups.get(dayKey).push(evt);
+  }
+
+  const lines = [];
+  for (const [dayKey, events] of dayGroups) {
+    const d = new Date(dayKey + 'T12:00:00');
+    const dayLabel = d.toLocaleDateString('en-US', {
+      weekday: 'long',
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+    lines.push(dayLabel);
+    lines.push('');
+
+    for (const evt of events) {
+      if (evt.start.date) {
+        // All-day event
+        lines.push(`All day         ${evt.summary || '(No title)'}`);
+      } else {
+        const startTime = formatTime(evt.start.dateTime);
+        const endTime = formatTime(evt.end.dateTime);
+        lines.push(`${startTime} - ${endTime}  ${evt.summary || '(No title)'}`);
+      }
+      lines.push(`               Calendar: ${evt._calendarName}`);
+      if (evt.location) {
+        lines.push(`               Location: ${evt.location}`);
+      }
+    }
+    lines.push('');
+  }
+
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+function formatTime(isoStr) {
+  const d = new Date(isoStr);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+async function calendarToday(args) {
+  args.days = 1;
+  args.from = undefined;
+  await calendarList(args);
+}
+
+async function calendarFreebusy(args) {
+  const emails = args._.slice(2);
+  if (emails.length === 0) die('Usage: google-api calendar freebusy <email> [email2...] [--from YYYY-MM-DD] [--days N]');
+
+  const token = await getAccessToken();
+  const days = args.days || 1;
+
+  let fromDate;
+  if (args.from) {
+    fromDate = new Date(args.from + 'T00:00:00');
+    if (isNaN(fromDate.getTime())) die(`Invalid date: ${args.from}`);
+  } else {
+    fromDate = new Date();
+    fromDate.setHours(0, 0, 0, 0);
+  }
+
+  const toDate = new Date(fromDate);
+  toDate.setDate(toDate.getDate() + days);
+  toDate.setHours(23, 59, 59, 999);
+
+  const body = JSON.stringify({
+    timeMin: fromDate.toISOString(),
+    timeMax: toDate.toISOString(),
+    items: emails.map((id) => ({ id })),
+  });
+
+  const res = await httpsRequest(
+    {
+      hostname: CALENDAR_HOST,
+      path: '/calendar/v3/freeBusy',
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    },
+    body,
+  );
+
+  if (res.status !== 200) handleApiError(res, 'calendar freebusy');
+
+  const data = JSON.parse(res.body);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+    return;
+  }
+
+  for (const email of emails) {
+    const cal = data.calendars[email];
+    process.stdout.write(`${email}:\n`);
+    if (!cal) {
+      process.stdout.write('  (not found)\n\n');
+      continue;
+    }
+    if (cal.errors && cal.errors.length > 0) {
+      process.stdout.write(`  Error: ${cal.errors[0].reason}\n\n`);
+      continue;
+    }
+    const busy = cal.busy || [];
+    if (busy.length === 0) {
+      process.stdout.write('  Free all day\n\n');
+      continue;
+    }
+    for (const slot of busy) {
+      process.stdout.write(`  Busy: ${formatTime(slot.start)} - ${formatTime(slot.end)}\n`);
+    }
+    process.stdout.write('\n');
+  }
+}
+
+// --- Auth commands ---
+
+async function authTest(args) {
+  const token = await getAccessToken();
+  const res = await apiGet(GMAIL_HOST, '/gmail/v1/users/me/profile', token);
+  if (res.status !== 200) handleApiError(res, 'auth test');
+
+  const profile = JSON.parse(res.body);
+
+  if (args.json) {
+    const creds = loadCredentials();
+    const cache = loadCache();
+    process.stdout.write(
+      JSON.stringify(
+        {
+          email: profile.emailAddress,
+          access_token: token,
+          token_source: cache && cache.access_token === token ? 'cache' : 'credentials',
+          token_expiry: (cache && cache.token_expiry) || creds.token_expiry,
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+    return;
+  }
+
+  process.stdout.write(`Authenticated as: ${profile.emailAddress}\n`);
+  process.stdout.write(`Messages total: ${profile.messagesTotal}\n`);
+  process.stdout.write(`Threads total: ${profile.threadsTotal}\n`);
+}
+
+// --- Usage ---
+
+function printUsage() {
+  const usage = `Usage: google-api <service> <command> [options]
+
+Services:
+  gmail list [--query "..."] [--limit N] [--days N]   List email threads
+  gmail read <thread-id>                               Read full email thread
+  gmail labels                                         List Gmail labels
+  calendar list [--days N] [--from YYYY-MM-DD]         List upcoming events
+  calendar today                                       Today's events
+  calendar freebusy <email> [--from DATE] [--days N]   Check availability
+  auth test                                            Verify credentials
+
+Flags:
+  --json       Output raw JSON
+  --limit N    Max results (gmail list, default: 10, max: 50)
+  --query "…"  Gmail search query
+  --days N     Time horizon (gmail: past N days, calendar: next N days)
+  --from DATE  Start date for calendar (YYYY-MM-DD, default: today)
+`;
+  process.stderr.write(usage);
+  process.exit(1);
+}
+
+// --- Main ---
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const service = args._[0];
+  const command = args._[1];
+
+  if (!service || !command) printUsage();
+
+  switch (service) {
+    case 'gmail':
+      switch (command) {
+        case 'list':
+          return gmailList(args);
+        case 'read':
+          return gmailRead(args);
+        case 'labels':
+          return gmailLabels(args);
+        default:
+          die(`Unknown gmail command: ${command}\nAvailable: list, read, labels`);
+      }
+      break;
+    case 'calendar':
+      switch (command) {
+        case 'list':
+          return calendarList(args);
+        case 'today':
+          return calendarToday(args);
+        case 'freebusy':
+          return calendarFreebusy(args);
+        default:
+          die(`Unknown calendar command: ${command}\nAvailable: list, today, freebusy`);
+      }
+      break;
+    case 'auth':
+      switch (command) {
+        case 'test':
+          return authTest(args);
+        default:
+          die(`Unknown auth command: ${command}\nAvailable: test`);
+      }
+      break;
+    default:
+      die(`Unknown service: ${service}\nAvailable: gmail, calendar, auth`);
+  }
+}
+
+main().catch((err) => {
+  if (err.code === 'ENOTFOUND' || err.code === 'ECONNREFUSED') {
+    die(`Network error: ${err.message}`);
+  }
+  die(err.message || String(err));
+});
