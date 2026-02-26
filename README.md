@@ -9,7 +9,7 @@ Built on [NanoClaw](https://github.com/qwibitai/nanoclaw). Single Node.js proces
 - **Email monitoring** — reads Gmail threads, finds pending replies, surfaces action items
 - **Calendar management** — checks availability, proposes events via inline keyboard (user taps to approve)
 - **Telegram conversation tracking** — reads personal Telegram conversations (via MTProto), detects unanswered messages
-- **Scheduled briefings** — morning summary (calendar + pending replies + emails), evening wrap-up, periodic checks
+- **Scheduled briefings** — can run morning summaries, evening wrap-ups, and periodic pending-reply checks on a cron schedule
 - **Web browsing** — full browser automation for research, form filling, data extraction
 - **General assistant** — answers questions, runs bash commands, manages files in isolated containers
 
