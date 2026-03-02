@@ -3,6 +3,7 @@ import { Bot, InlineKeyboard } from 'grammy';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { getAllTasks, getRouterState, setRouterState } from '../db.js';
 import { logger } from '../logger.js';
+import { transcribeAudio } from '../transcription.js';
 import type { QueueStatus } from '../group-queue.js';
 import {
   Channel,
@@ -227,9 +228,24 @@ export class TelegramChannel implements Channel {
 
     this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot.on('message:voice', (ctx) =>
-      storeNonText(ctx, '[Voice message]'),
-    );
+    this.bot.on('message:voice', async (ctx) => {
+      try {
+        const file = await ctx.getFile();
+        const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
+        const buffer = Buffer.from(await resp.arrayBuffer());
+        const transcript = await transcribeAudio(buffer);
+        if (transcript) {
+          storeNonText(ctx, `[Voice: ${transcript}]`);
+        } else {
+          storeNonText(ctx, '[Voice message — transcription unavailable]');
+        }
+      } catch (err) {
+        logger.error({ err }, 'Voice transcription failed');
+        storeNonText(ctx, '[Voice message — transcription failed]');
+      }
+    });
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
