@@ -1,18 +1,14 @@
 /**
- * MTProto Reader — Host-side HTTP server
+ * MTProto Reader — HTTP server for read-only Telegram access
  *
  * Holds the GramJS MTProto session and exposes read-only endpoints.
  * The agent calls this from inside the container via the telegram-reader CLI tool.
  *
- * Usage:
- *   node dist/mtproto-reader.js
- *
- * Setup:
- *   npx tsx scripts/mtproto-reader-setup.ts
+ * Integrated into the main NanoClaw process via startMtprotoReader/stopMtprotoReader.
+ * Self-contained with no shared mutable state — ready for Worker thread extraction.
  */
 import fs from 'fs';
 import http from 'http';
-import os from 'os';
 import path from 'path';
 
 import bigInt from 'big-integer';
@@ -20,18 +16,16 @@ import { Api, TelegramClient } from 'telegram';
 import type { Entity } from 'telegram/define.js';
 import { StringSession } from 'telegram/sessions/index.js';
 
-const HOME = os.homedir();
-const MTPROTO_DIR = path.join(HOME, '.mtproto-reader');
-const SESSION_FILE = path.join(MTPROTO_DIR, 'session');
-const CONFIG_FILE = path.join(MTPROTO_DIR, 'config.json');
+import { MTPROTO_API_ID, MTPROTO_API_HASH, DATA_DIR } from './config.js';
+import { logger } from './logger.js';
+
+const PORT = 8081;
+
+// Module-level refs for lifecycle management
+let _server: http.Server | null = null;
+let _client: TelegramClient | null = null;
 
 // --- Types ---
-
-interface Config {
-  apiId: number;
-  apiHash: string;
-  port: number;
-}
 
 interface PendingChat {
   chatId: string;
@@ -51,26 +45,6 @@ interface ConversationMessage {
   text: string;
   date: string;
   replyTo: number | null;
-}
-
-// --- Load config ---
-
-function loadConfig(): Config {
-  if (!fs.existsSync(CONFIG_FILE)) {
-    console.error(`Config not found at ${CONFIG_FILE}`);
-    console.error('Run: npx tsx scripts/mtproto-reader-setup.ts');
-    process.exit(1);
-  }
-  return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
-}
-
-function loadSession(): string {
-  if (!fs.existsSync(SESSION_FILE)) {
-    console.error(`Session not found at ${SESSION_FILE}`);
-    console.error('Run: npx tsx scripts/mtproto-reader-setup.ts');
-    process.exit(1);
-  }
-  return fs.readFileSync(SESSION_FILE, 'utf-8').trim();
 }
 
 // --- Helpers ---
@@ -133,146 +107,46 @@ function errorResponse(res: http.ServerResponse, status: number, message: string
   jsonResponse(res, status, { error: message });
 }
 
-// --- Server ---
+// --- Route handlers ---
 
-async function main(): Promise<void> {
-  const config = loadConfig();
-  const sessionString = loadSession();
-
-  console.log('Connecting to Telegram...');
-  const client = new TelegramClient(
-    new StringSession(sessionString),
-    config.apiId,
-    config.apiHash,
-    { connectionRetries: 5 },
-  );
-
-  await client.connect();
-
-  const me = await client.getMe() as Api.User;
-  const myName = me.firstName || me.username || 'Me';
-  console.log(`Connected as ${myName}`);
-
-  // --- Route handlers ---
-
-  async function handlePendingReplies(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-  ): Promise<void> {
-    if (!client.connected) {
-      errorResponse(res, 503, 'Not connected to Telegram');
-      return;
-    }
-
-    const url = new URL(req.url!, `http://localhost`);
-    const limitParam = url.searchParams.get('limit');
-    const limit = Math.min(Math.max(parseInt(limitParam || '20', 10) || 20, 1), 50);
-
-    const dialogs = await client.getDialogs({ limit });
-    const pending: PendingChat[] = [];
-
-    for (const dialog of dialogs) {
-      const entity = dialog.entity;
-      if (!entity) continue;
-
-      // Exclude bots
-      if (entity instanceof Api.User && entity.bot) continue;
-
-      // Exclude broadcast channels
-      if (entity instanceof Api.Channel && entity.broadcast) continue;
-
-      // Filter: unread or last message not from me
-      const isFromMe = dialog.message?.out === true;
-      if (dialog.unreadCount === 0 && isFromMe) continue;
-
-      // Exclude service messages
-      if (dialog.message && !(dialog.message instanceof Api.Message)) continue;
-
-      const msg = dialog.message as Api.Message | undefined;
-      const chatType = getChatType(dialog.dialog, entity);
-      let senderName = 'Unknown';
-
-      if (msg) {
-        if (msg.out) {
-          senderName = 'Me';
-        } else if (chatType === 'private') {
-          senderName = getChatName(entity);
-        } else {
-          try {
-            const sender = await msg.getSender();
-            if (sender && sender instanceof Api.User) {
-              senderName = sender.firstName || sender.username || 'Unknown';
-            }
-          } catch {
-            senderName = 'Unknown';
-          }
-        }
-      }
-
-      pending.push({
-        chatId: getChatId(entity),
-        chatName: getChatName(entity),
-        chatType,
-        lastMessage: {
-          sender: senderName,
-          text: msg?.message || (msg ? mediaPlaceholder(msg) : ''),
-          date: msg ? new Date(msg.date * 1000).toISOString() : '',
-        },
-        unreadCount: dialog.unreadCount,
-      });
-    }
-
-    jsonResponse(res, 200, pending);
+async function handlePendingReplies(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (!_client?.connected) {
+    errorResponse(res, 503, 'Not connected to Telegram');
+    return;
   }
 
-  async function handleConversations(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-  ): Promise<void> {
-    if (!client.connected) {
-      errorResponse(res, 503, 'Not connected to Telegram');
-      return;
-    }
+  const url = new URL(req.url!, `http://localhost`);
+  const limitParam = url.searchParams.get('limit');
+  const limit = Math.min(Math.max(parseInt(limitParam || '20', 10) || 20, 1), 50);
 
-    const url = new URL(req.url!, `http://localhost`);
-    const daysParam = url.searchParams.get('days');
-    const limitParam = url.searchParams.get('limit');
-    const days = Math.min(Math.max(parseInt(daysParam || '7', 10) || 7, 1), 30);
-    const limit = Math.min(Math.max(parseInt(limitParam || '50', 10) || 50, 1), 100);
+  const dialogs = await _client.getDialogs({ limit });
+  const pending: PendingChat[] = [];
 
-    const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
+  for (const dialog of dialogs) {
+    const entity = dialog.entity;
+    if (!entity) continue;
 
-    const dialogs = await client.getDialogs({ limit });
-    const results: Array<{
-      chatId: string;
-      chatName: string;
-      chatType: 'private' | 'group' | 'channel';
-      lastMessage: { sender: string; text: string; date: string };
-      lastMessageIsFromMe: boolean;
-      unreadCount: number;
-    }> = [];
+    // Exclude bots
+    if (entity instanceof Api.User && entity.bot) continue;
 
-    for (const dialog of dialogs) {
-      const entity = dialog.entity;
-      if (!entity) continue;
+    // Exclude broadcast channels
+    if (entity instanceof Api.Channel && entity.broadcast) continue;
 
-      // Exclude bots
-      if (entity instanceof Api.User && entity.bot) continue;
+    // Filter: unread or last message not from me
+    const isFromMe = dialog.message?.out === true;
+    if (dialog.unreadCount === 0 && isFromMe) continue;
 
-      // Exclude broadcast channels
-      if (entity instanceof Api.Channel && entity.broadcast) continue;
+    // Exclude service messages
+    if (dialog.message && !(dialog.message instanceof Api.Message)) continue;
 
-      // Exclude service messages
-      if (dialog.message && !(dialog.message instanceof Api.Message)) continue;
+    const msg = dialog.message as Api.Message | undefined;
+    const chatType = getChatType(dialog.dialog, entity);
+    let senderName = 'Unknown';
 
-      const msg = dialog.message as Api.Message | undefined;
-
-      // Filter by time window
-      if (!msg || msg.date < cutoff) continue;
-
-      const chatType = getChatType(dialog.dialog, entity);
-      let senderName = 'Unknown';
-
+    if (msg) {
       if (msg.out) {
         senderName = 'Me';
       } else if (chatType === 'private') {
@@ -287,157 +161,269 @@ async function main(): Promise<void> {
           senderName = 'Unknown';
         }
       }
-
-      results.push({
-        chatId: getChatId(entity),
-        chatName: getChatName(entity),
-        chatType,
-        lastMessage: {
-          sender: senderName,
-          text: msg.message || mediaPlaceholder(msg),
-          date: new Date(msg.date * 1000).toISOString(),
-        },
-        lastMessageIsFromMe: msg.out === true,
-        unreadCount: dialog.unreadCount,
-      });
     }
 
-    jsonResponse(res, 200, results);
+    pending.push({
+      chatId: getChatId(entity),
+      chatName: getChatName(entity),
+      chatType,
+      lastMessage: {
+        sender: senderName,
+        text: msg?.message || (msg ? mediaPlaceholder(msg) : ''),
+        date: msg ? new Date(msg.date * 1000).toISOString() : '',
+      },
+      unreadCount: dialog.unreadCount,
+    });
   }
 
-  async function handleConversation(
-    req: http.IncomingMessage,
-    res: http.ServerResponse,
-    chatIdStr: string,
-  ): Promise<void> {
-    if (!client.connected) {
-      errorResponse(res, 503, 'Not connected to Telegram');
-      return;
-    }
+  jsonResponse(res, 200, pending);
+}
 
-    const url = new URL(req.url!, `http://localhost`);
-    const limitParam = url.searchParams.get('limit');
-    const limit = Math.min(Math.max(parseInt(limitParam || '20', 10) || 20, 1), 100);
+async function handleConversations(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  if (!_client?.connected) {
+    errorResponse(res, 503, 'Not connected to Telegram');
+    return;
+  }
 
-    // Parse chat ID — can be negative for groups/channels
-    const chatId = bigInt(chatIdStr);
+  const url = new URL(req.url!, `http://localhost`);
+  const daysParam = url.searchParams.get('days');
+  const limitParam = url.searchParams.get('limit');
+  const days = Math.min(Math.max(parseInt(daysParam || '7', 10) || 7, 1), 30);
+  const limit = Math.min(Math.max(parseInt(limitParam || '50', 10) || 50, 1), 100);
 
-    let entity: Entity;
-    try {
-      entity = await client.getEntity(chatId) as Entity;
-    } catch {
-      errorResponse(res, 404, `Chat not found: ${chatIdStr}`);
-      return;
-    }
+  const cutoff = Math.floor(Date.now() / 1000) - days * 86400;
 
-    const messages = await client.getMessages(entity, { limit });
-    const result: ConversationMessage[] = [];
+  const dialogs = await _client.getDialogs({ limit });
+  const results: Array<{
+    chatId: string;
+    chatName: string;
+    chatType: 'private' | 'group' | 'channel';
+    lastMessage: { sender: string; text: string; date: string };
+    lastMessageIsFromMe: boolean;
+    unreadCount: number;
+  }> = [];
 
-    for (const msg of messages) {
-      if (!(msg instanceof Api.Message)) continue;
+  for (const dialog of dialogs) {
+    const entity = dialog.entity;
+    if (!entity) continue;
 
-      let senderName: string;
-      if (msg.out) {
-        senderName = 'Me';
-      } else {
-        try {
-          const sender = await msg.getSender();
-          if (sender && sender instanceof Api.User) {
-            senderName = sender.firstName || sender.username || 'Unknown';
-          } else if (sender && (sender instanceof Api.Chat || sender instanceof Api.Channel)) {
-            senderName = sender.title || 'Unknown';
-          } else {
-            senderName = 'Unknown';
-          }
-        } catch {
-          senderName = 'Unknown';
+    // Exclude bots
+    if (entity instanceof Api.User && entity.bot) continue;
+
+    // Exclude broadcast channels
+    if (entity instanceof Api.Channel && entity.broadcast) continue;
+
+    // Exclude service messages
+    if (dialog.message && !(dialog.message instanceof Api.Message)) continue;
+
+    const msg = dialog.message as Api.Message | undefined;
+
+    // Filter by time window
+    if (!msg || msg.date < cutoff) continue;
+
+    const chatType = getChatType(dialog.dialog, entity);
+    let senderName = 'Unknown';
+
+    if (msg.out) {
+      senderName = 'Me';
+    } else if (chatType === 'private') {
+      senderName = getChatName(entity);
+    } else {
+      try {
+        const sender = await msg.getSender();
+        if (sender && sender instanceof Api.User) {
+          senderName = sender.firstName || sender.username || 'Unknown';
         }
+      } catch {
+        senderName = 'Unknown';
       }
+    }
 
-      result.push({
-        id: msg.id,
+    results.push({
+      chatId: getChatId(entity),
+      chatName: getChatName(entity),
+      chatType,
+      lastMessage: {
         sender: senderName,
         text: msg.message || mediaPlaceholder(msg),
         date: new Date(msg.date * 1000).toISOString(),
-        replyTo: msg.replyTo?.replyToMsgId ?? null,
-      });
-    }
-
-    jsonResponse(res, 200, {
-      chatId: chatIdStr,
-      chatName: getChatName(entity),
-      messages: result,
+      },
+      lastMessageIsFromMe: msg.out === true,
+      unreadCount: dialog.unreadCount,
     });
   }
 
-  async function handleHealth(
-    _req: http.IncomingMessage,
-    res: http.ServerResponse,
-  ): Promise<void> {
-    jsonResponse(res, 200, {
-      status: 'ok',
-      connected: client.connected,
-      user: myName,
-    });
+  jsonResponse(res, 200, results);
+}
+
+async function handleConversation(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  chatIdStr: string,
+): Promise<void> {
+  if (!_client?.connected) {
+    errorResponse(res, 503, 'Not connected to Telegram');
+    return;
   }
 
-  // --- HTTP server ---
+  const url = new URL(req.url!, `http://localhost`);
+  const limitParam = url.searchParams.get('limit');
+  const limit = Math.min(Math.max(parseInt(limitParam || '20', 10) || 20, 1), 100);
 
-  const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url!, `http://localhost`);
-    const pathname = url.pathname;
+  // Parse chat ID — can be negative for groups/channels
+  const chatId = bigInt(chatIdStr);
 
-    if (req.method !== 'GET') {
-      errorResponse(res, 404, 'Not found');
-      return;
-    }
+  let entity: Entity;
+  try {
+    entity = await _client.getEntity(chatId) as Entity;
+  } catch {
+    errorResponse(res, 404, `Chat not found: ${chatIdStr}`);
+    return;
+  }
 
-    try {
-      if (pathname === '/health') {
-        await handleHealth(req, res);
-      } else if (pathname === '/pending-replies') {
-        await handlePendingReplies(req, res);
-      } else if (pathname === '/conversations') {
-        await handleConversations(req, res);
-      } else if (pathname.startsWith('/conversation/')) {
-        const chatIdStr = pathname.slice('/conversation/'.length);
-        if (!chatIdStr || !/^-?\d+$/.test(chatIdStr)) {
-          errorResponse(res, 400, 'Invalid chat ID');
-          return;
+  const messages = await _client.getMessages(entity, { limit });
+  const result: ConversationMessage[] = [];
+
+  for (const msg of messages) {
+    if (!(msg instanceof Api.Message)) continue;
+
+    let senderName: string;
+    if (msg.out) {
+      senderName = 'Me';
+    } else {
+      try {
+        const sender = await msg.getSender();
+        if (sender && sender instanceof Api.User) {
+          senderName = sender.firstName || sender.username || 'Unknown';
+        } else if (sender && (sender instanceof Api.Chat || sender instanceof Api.Channel)) {
+          senderName = sender.title || 'Unknown';
+        } else {
+          senderName = 'Unknown';
         }
-        await handleConversation(req, res, chatIdStr);
-      } else {
-        errorResponse(res, 404, 'Not found');
+      } catch {
+        senderName = 'Unknown';
       }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error(`Error handling ${pathname}:`, message);
-      errorResponse(res, 500, message);
     }
-  });
 
-  const port = config.port || 8081;
-  server.listen(port, '127.0.0.1', () => {
-    console.log(`MTProto Reader listening on http://127.0.0.1:${port}`);
-    console.log('Endpoints:');
-    console.log(`  GET /health`);
-    console.log(`  GET /conversations?days=7&limit=50`);
-    console.log(`  GET /pending-replies?limit=20`);
-    console.log(`  GET /conversation/:chatId?limit=20`);
-  });
-
-  // Graceful shutdown
-  for (const signal of ['SIGINT', 'SIGTERM'] as const) {
-    process.on(signal, async () => {
-      console.log(`\nReceived ${signal}, shutting down...`);
-      server.close();
-      await client.disconnect();
-      process.exit(0);
+    result.push({
+      id: msg.id,
+      sender: senderName,
+      text: msg.message || mediaPlaceholder(msg),
+      date: new Date(msg.date * 1000).toISOString(),
+      replyTo: msg.replyTo?.replyToMsgId ?? null,
     });
+  }
+
+  jsonResponse(res, 200, {
+    chatId: chatIdStr,
+    chatName: getChatName(entity),
+    messages: result,
+  });
+}
+
+async function handleHealth(
+  _req: http.IncomingMessage,
+  res: http.ServerResponse,
+  myName: string,
+): Promise<void> {
+  jsonResponse(res, 200, {
+    status: 'ok',
+    connected: _client?.connected ?? false,
+    user: myName,
+  });
+}
+
+// --- Exported lifecycle functions ---
+
+export async function startMtprotoReader(): Promise<void> {
+  if (!MTPROTO_API_ID || !MTPROTO_API_HASH) {
+    logger.info('MTProto Reader not configured, skipping');
+    return;
+  }
+
+  const sessionPath = path.join(DATA_DIR, 'mtproto-session');
+  if (!fs.existsSync(sessionPath)) {
+    logger.info('MTProto session not found, skipping');
+    return;
+  }
+
+  const sessionString = fs.readFileSync(sessionPath, 'utf-8').trim();
+
+  try {
+    logger.info('MTProto Reader: connecting to Telegram...');
+    const client = new TelegramClient(
+      new StringSession(sessionString),
+      MTPROTO_API_ID,
+      MTPROTO_API_HASH,
+      { connectionRetries: 5 },
+    );
+
+    await client.connect();
+    _client = client;
+
+    const me = await client.getMe() as Api.User;
+    const myName = me.firstName || me.username || 'Me';
+    logger.info({ user: myName }, 'MTProto Reader: connected');
+
+    // --- HTTP server ---
+
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url!, `http://localhost`);
+      const pathname = url.pathname;
+
+      if (req.method !== 'GET') {
+        errorResponse(res, 404, 'Not found');
+        return;
+      }
+
+      try {
+        if (pathname === '/health') {
+          await handleHealth(req, res, myName);
+        } else if (pathname === '/pending-replies') {
+          await handlePendingReplies(req, res);
+        } else if (pathname === '/conversations') {
+          await handleConversations(req, res);
+        } else if (pathname.startsWith('/conversation/')) {
+          const chatIdStr = pathname.slice('/conversation/'.length);
+          if (!chatIdStr || !/^-?\d+$/.test(chatIdStr)) {
+            errorResponse(res, 400, 'Invalid chat ID');
+            return;
+          }
+          await handleConversation(req, res, chatIdStr);
+        } else {
+          errorResponse(res, 404, 'Not found');
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error({ pathname, err }, 'MTProto Reader: request error');
+        errorResponse(res, 500, message);
+      }
+    });
+
+    _server = server;
+
+    server.listen(PORT, '127.0.0.1', () => {
+      logger.info({ port: PORT }, 'MTProto Reader: HTTP server listening');
+    });
+  } catch (err) {
+    logger.error({ err }, 'MTProto Reader failed to start');
   }
 }
 
-main().catch((err) => {
-  console.error(`Fatal: ${err.message || err}`);
-  process.exit(1);
-});
+export async function stopMtprotoReader(): Promise<void> {
+  if (_server) {
+    _server.close();
+    _server = null;
+  }
+  if (_client) {
+    try {
+      await _client.disconnect();
+    } catch {
+      // ignore disconnect errors during shutdown
+    }
+    _client = null;
+  }
+}

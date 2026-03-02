@@ -10,6 +10,8 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'TELEGRAM_BOT_TOKEN',
   'TELEGRAM_ONLY',
+  'MTPROTO_API_ID',
+  'MTPROTO_API_HASH',
 ]);
 
 export const ASSISTANT_NAME =
@@ -74,3 +76,7 @@ export const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_ONLY =
   (process.env.TELEGRAM_ONLY || envConfig.TELEGRAM_ONLY) === 'true';
+
+// MTProto Reader configuration
+export const MTPROTO_API_ID = parseInt(envConfig.MTPROTO_API_ID || '', 10) || 0;
+export const MTPROTO_API_HASH = envConfig.MTPROTO_API_HASH || '';

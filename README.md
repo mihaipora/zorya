@@ -29,26 +29,6 @@ The core principle: **the agent can read everything but write nothing without ex
 
 Each group gets an isolated Docker container with its own filesystem and `CLAUDE.md` memory. Only explicitly mounted directories are accessible. IPC via filesystem.
 
-## Calendar Approval Flow
-
-```
-Agent detects scheduling intent
-  → checks calendar availability (freebusy)
-  → calls propose_event MCP tool
-  → host validates, saves to DB, sends inline keyboard to Telegram:
-
-    📅 Coffee with Alice
-    Wed 27 Feb, 14:00 – 14:30
-    Attendees: alice@example.com
-
-    [✅ Create]  [❌ Skip]
-
-  → user taps Create → host calls Calendar API → event created
-  → user taps Skip → proposal dismissed
-```
-
-Proposals expire after 24 hours.
-
 ## Setup
 
 ```bash
@@ -58,9 +38,11 @@ npm install
 claude
 ```
 
-Then run `/setup`. Claude Code handles container build, Google OAuth, Telegram bot/MTProto setup, and service registration.
+Then run `/setup`. Claude Code handles container build, Google OAuth, Telegram bot setup, and service registration.
 
 **Requirements:** Node.js 20+, Docker, Anthropic API key, Telegram bot token (from BotFather).
+
+See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for optional integrations (Telegram conversation reading, voice transcription).
 
 ## Architecture
 
@@ -86,7 +68,8 @@ Key files:
 | `src/db.ts` | SQLite (messages, groups, sessions, event proposals) |
 | `src/task-scheduler.ts` | Cron/interval/one-time scheduled tasks |
 | `container/tools/google-api` | Gmail + Calendar CLI (read-only, baked into container) |
-| `container/tools/telegram-reader` | Telegram conversation reader CLI |
+| `src/mtproto-reader.ts` | MTProto session + HTTP API for Telegram conversation reading |
+| `container/tools/telegram-reader` | Telegram conversation reader CLI (calls MTProto HTTP API) |
 | `container/agent-runner/src/ipc-mcp-stdio.ts` | MCP tools: send_message, schedule_task, propose_event |
 | `groups/*/CLAUDE.md` | Per-group agent memory (isolated) |
 

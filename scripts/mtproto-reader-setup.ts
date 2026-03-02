@@ -3,12 +3,11 @@
  * MTProto Reader Setup Script for NanoClaw
  *
  * One-time script to authenticate with Telegram via GramJS and save the session.
- * The session is used by the MTProto Reader HTTP server (src/mtproto-reader.ts).
+ * The session is used by the MTProto Reader (integrated into the main process).
  *
  * Usage:
  *   npx tsx scripts/mtproto-reader-setup.ts
  */
-import Database from 'better-sqlite3';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -19,12 +18,9 @@ import { StringSession } from 'telegram/sessions/index.js';
 
 const HOME = os.homedir();
 const MTPROTO_DIR = path.join(HOME, '.mtproto-reader');
-const DOCS_DIR = path.join(MTPROTO_DIR, 'docs');
-const SESSION_FILE = path.join(MTPROTO_DIR, 'session');
-const CONFIG_FILE = path.join(MTPROTO_DIR, 'config.json');
-const CLAUDE_MD_PATH = path.join(DOCS_DIR, 'CLAUDE.md');
-const ALLOWLIST_PATH = path.join(HOME, '.config', 'nanoclaw', 'mount-allowlist.json');
-const DB_PATH = path.join(process.cwd(), 'store', 'messages.db');
+const ENV_PATH = path.join(process.cwd(), '.env');
+const DATA_DIR = path.join(process.cwd(), 'data');
+const SESSION_PATH = path.join(DATA_DIR, 'mtproto-session');
 
 // --- Helpers ---
 
@@ -43,14 +39,83 @@ function ask(prompt: string): Promise<string> {
   });
 }
 
+/**
+ * Read a key from the .env file. Returns empty string if not found.
+ */
+function readEnvKey(key: string): string {
+  if (!fs.existsSync(ENV_PATH)) return '';
+  const content = fs.readFileSync(ENV_PATH, 'utf-8');
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const k = trimmed.slice(0, eqIdx).trim();
+    if (k !== key) continue;
+    let value = trimmed.slice(eqIdx + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    return value;
+  }
+  return '';
+}
+
+/**
+ * Set a key=value in the .env file. Replaces existing key or appends.
+ */
+function setEnvKey(key: string, value: string): void {
+  let content = '';
+  if (fs.existsSync(ENV_PATH)) {
+    content = fs.readFileSync(ENV_PATH, 'utf-8');
+  }
+
+  const lines = content.split('\n');
+  let found = false;
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const k = trimmed.slice(0, eqIdx).trim();
+    if (k === key) {
+      lines[i] = `${key}=${value}`;
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    // Ensure trailing newline before appending
+    if (content.length > 0 && !content.endsWith('\n')) {
+      lines.push('');
+    }
+    lines.push(`${key}=${value}`);
+  }
+
+  fs.writeFileSync(ENV_PATH, lines.join('\n'));
+}
+
 // --- Step 1: Get API credentials ---
 
 async function getApiCredentials(): Promise<{ apiId: number; apiHash: string }> {
-  // Check if config already exists
-  if (fs.existsSync(CONFIG_FILE)) {
-    const existing = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+  // Check if credentials already exist in .env
+  const existingId = readEnvKey('MTPROTO_API_ID');
+  const existingHash = readEnvKey('MTPROTO_API_HASH');
+  if (existingId && existingHash) {
+    console.log('Using existing API credentials from .env');
+    return { apiId: parseInt(existingId, 10), apiHash: existingHash };
+  }
+
+  // Fall back to old config location
+  const oldConfigFile = path.join(MTPROTO_DIR, 'config.json');
+  if (fs.existsSync(oldConfigFile)) {
+    const existing = JSON.parse(fs.readFileSync(oldConfigFile, 'utf-8'));
     if (existing.apiId && existing.apiHash) {
-      console.log(`Using existing API credentials from ${CONFIG_FILE}`);
+      console.log(`Migrating API credentials from ${oldConfigFile} to .env`);
       return { apiId: existing.apiId, apiHash: existing.apiHash };
     }
   }
@@ -70,9 +135,17 @@ async function getApiCredentials(): Promise<{ apiId: number; apiHash: string }> 
 // --- Step 2: Authenticate with Telegram ---
 
 async function authenticate(apiId: number, apiHash: string): Promise<string> {
-  const existingSession = fs.existsSync(SESSION_FILE)
-    ? fs.readFileSync(SESSION_FILE, 'utf-8').trim()
-    : '';
+  // Check for existing session in new location, then old location
+  let existingSession = '';
+  if (fs.existsSync(SESSION_PATH)) {
+    existingSession = fs.readFileSync(SESSION_PATH, 'utf-8').trim();
+  } else {
+    const oldSessionFile = path.join(MTPROTO_DIR, 'session');
+    if (fs.existsSync(oldSessionFile)) {
+      existingSession = fs.readFileSync(oldSessionFile, 'utf-8').trim();
+      console.log('Found existing session in old location, will migrate');
+    }
+  }
 
   const client = new TelegramClient(
     new StringSession(existingSession),
@@ -97,225 +170,34 @@ async function authenticate(apiId: number, apiHash: string): Promise<string> {
 
 // --- Step 3: Save config and session ---
 
-function saveConfig(apiId: number, apiHash: string, port: number): void {
-  fs.mkdirSync(MTPROTO_DIR, { recursive: true });
-
-  const config = { apiId, apiHash, port };
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2) + '\n');
-  fs.chmodSync(CONFIG_FILE, 0o600);
-  console.log(`Saved config to ${CONFIG_FILE}`);
+function saveConfig(apiId: number, apiHash: string): void {
+  setEnvKey('MTPROTO_API_ID', String(apiId));
+  setEnvKey('MTPROTO_API_HASH', apiHash);
+  console.log('Saved MTPROTO_API_ID and MTPROTO_API_HASH to .env');
 }
 
 function saveSession(sessionString: string): void {
-  fs.writeFileSync(SESSION_FILE, sessionString + '\n');
-  fs.chmodSync(SESSION_FILE, 0o600);
-  console.log(`Saved session to ${SESSION_FILE}`);
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(SESSION_PATH, sessionString + '\n');
+  fs.chmodSync(SESSION_PATH, 0o600);
+  console.log(`Saved session to ${SESSION_PATH}`);
 }
 
-// --- Step 4: Write CLAUDE.md ---
+// --- Step 4: Print restart instructions ---
 
-function writeClaudeMd(): void {
-  fs.mkdirSync(DOCS_DIR, { recursive: true });
-
-  const content = `# Telegram Reader — Conversation Access
-
-The \`telegram-reader\` CLI tool provides read-only access to the user's Telegram conversations.
-
-## Commands
-
-\`\`\`bash
-# List all conversations updated in the past 7 days
-telegram-reader conversations
-
-# Narrow the time window
-telegram-reader conversations --days 1
-
-# List chats where you have pending replies (unread or last message not from you)
-telegram-reader pending
-
-# Read messages from a specific chat
-telegram-reader conversation <chatId>
-
-# More messages
-telegram-reader conversation <chatId> --limit 50
-
-# Check if the reader is running
-telegram-reader health
-\`\`\`
-
-## Flags
-
-| Flag | Description |
-|------|-------------|
-| \`--json\` | Output raw JSON instead of formatted text |
-| \`--limit N\` | Max results (default: 20; conversations: 50) |
-| \`--days N\` | Time window for conversations (default: 7, max: 30) |
-
-## Common Patterns
-
-- **Review recent conversations:** \`telegram-reader conversations --days 7\` then \`telegram-reader conversation <chatId>\` for each that needs attention
-- **Check pending replies:** \`telegram-reader pending\`
-- **Read conversation context:** \`telegram-reader conversation <chatId>\` (use chatId from conversations/pending output)
-- **Morning briefing:** combine \`telegram-reader conversations --days 1\` + \`google-api gmail list --days 1\` + \`google-api calendar today\`
-
-## Notes
-
-- Read-only — cannot send, delete, or modify messages
-- Chat IDs are numeric (can be negative for groups)
-- Media messages show as placeholders: [Photo], [Document: file.pdf], [Voice message]
-`;
-
-  fs.writeFileSync(CLAUDE_MD_PATH, content);
-  console.log(`Wrote agent docs to ${CLAUDE_MD_PATH}`);
-}
-
-// --- Step 5: Update mount allowlist ---
-
-function updateMountAllowlist(): void {
-  if (!fs.existsSync(ALLOWLIST_PATH)) {
-    console.log(`\nMount allowlist not found at ${ALLOWLIST_PATH}, creating it...`);
-    fs.mkdirSync(path.dirname(ALLOWLIST_PATH), { recursive: true });
-    const template = {
-      allowedRoots: [],
-      blockedPatterns: [],
-      nonMainReadOnly: true,
-    };
-    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(template, null, 2) + '\n');
-  }
-
-  const allowlist = JSON.parse(fs.readFileSync(ALLOWLIST_PATH, 'utf-8'));
-
-  const alreadyPresent = allowlist.allowedRoots.some(
-    (r: { path?: string }) => r.path === '~/.mtproto-reader/docs',
-  );
-
-  if (!alreadyPresent) {
-    allowlist.allowedRoots.push({
-      path: '~/.mtproto-reader/docs',
-      allowReadWrite: false,
-      description: 'MTProto reader docs (read-only)',
-    });
-    fs.writeFileSync(ALLOWLIST_PATH, JSON.stringify(allowlist, null, 2) + '\n');
-    console.log(`Updated mount allowlist: added ~/.mtproto-reader/docs as allowed root`);
-  } else {
-    console.log(`Mount allowlist already contains ~/.mtproto-reader/docs`);
-  }
-}
-
-// --- Step 6: Update group container_config in SQLite ---
-
-function updateGroupContainerConfig(): void {
-  if (!fs.existsSync(DB_PATH)) {
-    console.log(`\nDatabase not found at ${DB_PATH}, skipping container config update.`);
-    console.log('Run the bot first to initialize the database, then re-run this script.');
-    return;
-  }
-
-  const db = new Database(DB_PATH);
-
-  try {
-    const row = db
-      .prepare("SELECT jid, container_config FROM registered_groups WHERE folder = 'main'")
-      .get() as { jid: string; container_config: string | null } | undefined;
-
-    if (!row) {
-      console.log('\nNo main group found in database, skipping container config update.');
-      console.log('Register the main group first, then re-run this script.');
-      return;
-    }
-
-    const config = row.container_config ? JSON.parse(row.container_config) : {};
-    const mounts: Array<{ hostPath: string; containerPath?: string; readonly?: boolean }> =
-      config.additionalMounts || [];
-
-    const alreadyPresent = mounts.some(
-      (m) => m.hostPath === '~/.mtproto-reader/docs',
-    );
-
-    if (!alreadyPresent) {
-      mounts.push({ hostPath: '~/.mtproto-reader/docs', containerPath: 'mtproto-reader', readonly: true });
-      config.additionalMounts = mounts;
-
-      db.prepare(
-        'UPDATE registered_groups SET container_config = ? WHERE jid = ?',
-      ).run(JSON.stringify(config), row.jid);
-
-      console.log(`Updated main group container config: added ~/.mtproto-reader/docs mount`);
-    } else {
-      console.log(`Main group container config already has ~/.mtproto-reader/docs mount`);
-    }
-  } finally {
-    db.close();
-  }
-}
-
-// --- Step 7: Print service instructions ---
-
-function printServiceInstructions(): void {
-  const nodePath = process.execPath;
-  const projectDir = process.cwd();
-  const serverScript = path.join(projectDir, 'dist', 'mtproto-reader.js');
-
-  console.log('\n=== Service Installation ===\n');
+function printRestartInstructions(): void {
+  console.log('\n=== Activation ===\n');
+  console.log('MTProto Reader is now built into the main NanoClaw process.');
+  console.log('Restart to activate:\n');
 
   if (process.platform === 'darwin') {
-    const plistPath = path.join(HOME, 'Library', 'LaunchAgents', 'com.nanoclaw-mtproto-reader.plist');
-    const logDir = path.join(projectDir, 'logs');
-
-    console.log(`Create ${plistPath} with:\n`);
-    console.log(`<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.nanoclaw-mtproto-reader</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>${nodePath}</string>
-        <string>${serverScript}</string>
-    </array>
-    <key>WorkingDirectory</key>
-    <string>${projectDir}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${logDir}/mtproto-reader.log</string>
-    <key>StandardErrorPath</key>
-    <string>${logDir}/mtproto-reader.error.log</string>
-</dict>
-</plist>`);
-
-    console.log(`\nThen run:`);
-    console.log(`  mkdir -p ${logDir}`);
-    console.log(`  launchctl load ${plistPath}`);
+    console.log('  launchctl kickstart -k gui/$(id -u)/com.nanoclaw');
   } else {
-    const serviceDir = path.join(HOME, '.config', 'systemd', 'user');
-    const servicePath = path.join(serviceDir, 'nanoclaw-mtproto-reader.service');
-
-    console.log(`Create ${servicePath} with:\n`);
-    console.log(`[Unit]
-Description=NanoClaw MTProto Reader
-After=network.target
-
-[Service]
-ExecStart=${nodePath} ${serverScript}
-WorkingDirectory=${projectDir}
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=default.target`);
-
-    console.log(`\nThen run:`);
-    console.log(`  mkdir -p ${serviceDir}`);
-    console.log(`  systemctl --user enable --now nanoclaw-mtproto-reader`);
+    console.log('  systemctl --user restart nanoclaw');
   }
 
   console.log('\nOr test manually:');
-  console.log(`  npm run build && node ${serverScript}`);
+  console.log('  npm run build && npm run dev');
 }
 
 // --- Main ---
@@ -331,23 +213,13 @@ async function main(): Promise<void> {
   const sessionString = await authenticate(apiId, apiHash);
 
   // Step 3: Save config and session
-  saveConfig(apiId, apiHash, 8081);
+  saveConfig(apiId, apiHash);
   saveSession(sessionString);
 
-  // Step 4: Write CLAUDE.md
-  writeClaudeMd();
+  // Step 4: Print restart instructions
+  printRestartInstructions();
 
-  // Step 5: Update mount allowlist
-  updateMountAllowlist();
-
-  // Step 6: Update group container_config
-  updateGroupContainerConfig();
-
-  // Step 7: Print service instructions
-  printServiceInstructions();
-
-  console.log('\nDone! Build and start the server:');
-  console.log('  npm run build && node dist/mtproto-reader.js');
+  console.log('\nDone!');
 
   process.exit(0);
 }
