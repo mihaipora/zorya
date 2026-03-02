@@ -10,6 +10,7 @@ Built on [NanoClaw](https://github.com/qwibitai/nanoclaw). Single Node.js proces
 - **Calendar management** — checks availability, proposes events via inline keyboard (user taps to approve)
 - **Telegram conversation tracking** — reads personal Telegram conversations (via MTProto), detects unanswered messages
 - **Scheduled briefings** — can run morning summaries, evening wrap-ups, and periodic pending-reply checks on a cron schedule
+- **Task management** — reads Todoist tasks, creates and completes todos with user approval (or auto-execute in yolo mode)
 - **Web browsing** — full browser automation for research, form filling, data extraction
 - **General assistant** — answers questions, runs bash commands, manages files in isolated containers
 
@@ -23,6 +24,8 @@ The core principle: **the agent can read everything but write nothing without ex
 | Send emails | No (scope prevents it) | — |
 | Read calendar | Yes | — |
 | Create calendar events | No (CLI has no write commands) | Yes, only after user taps "Create" |
+| Read Todoist tasks | Yes (via host-side HTTP proxy) | Yes |
+| Create/complete Todoist tasks | No (IPC only) | Yes, after user approval or in yolo mode |
 | Read Telegram conversations | Yes (via host-side MTProto reader) | Yes |
 | Send Telegram messages | Yes (via bot API, to registered chats only) | Yes |
 | Access MTProto session | No (not mounted) | Yes |
@@ -42,7 +45,7 @@ Then run `/setup`. Claude Code handles container build, Google OAuth, Telegram b
 
 **Requirements:** Node.js 20+, Docker, Anthropic API key, Telegram bot token (from BotFather).
 
-See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for optional integrations (Telegram conversation reading, voice transcription).
+See [docs/INTEGRATIONS.md](docs/INTEGRATIONS.md) for optional integrations (Todoist, Telegram conversation reading, voice transcription).
 
 ## Architecture
 
@@ -51,7 +54,7 @@ Telegram (grammy) → SQLite → Polling loop → Docker container (Claude Agent
                                                   ↓
                                            IPC (filesystem)
                                                   ↓
-                                    propose_event / send_message / schedule_task
+                                    propose_event / create_todo / send_message / schedule_task
                                                   ↓
                                          Host processes action
 ```
@@ -65,12 +68,15 @@ Key files:
 | `src/calendar-approval.ts` | OAuth token management, Calendar API event creation |
 | `src/ipc.ts` | IPC watcher: messages, tasks, event proposals |
 | `src/container-runner.ts` | Spawns streaming agent containers with mounts |
-| `src/db.ts` | SQLite (messages, groups, sessions, event proposals) |
+| `src/todoist.ts` | Todoist API client + HTTP route handler |
+| `src/tools-proxy.ts` | Shared HTTP proxy (port 8081) for container tool APIs |
+| `src/db.ts` | SQLite (messages, groups, sessions, event/todoist proposals) |
 | `src/task-scheduler.ts` | Cron/interval/one-time scheduled tasks |
 | `container/tools/google-api` | Gmail + Calendar CLI (read-only, baked into container) |
 | `src/mtproto-reader.ts` | MTProto session + HTTP API for Telegram conversation reading |
 | `container/tools/telegram-reader` | Telegram conversation reader CLI (calls MTProto HTTP API) |
-| `container/agent-runner/src/ipc-mcp-stdio.ts` | MCP tools: send_message, schedule_task, propose_event |
+| `container/tools/todoist` | Todoist CLI (calls host HTTP proxy for task reads) |
+| `container/agent-runner/src/ipc-mcp-stdio.ts` | MCP tools: send_message, schedule_task, propose_event, create_todo, complete_todo |
 | `groups/*/CLAUDE.md` | Per-group agent memory (isolated) |
 
 ## Telegram Commands
@@ -80,6 +86,7 @@ Key files:
 | `/status` | Queue status, active agents, scheduled tasks |
 | `/verbose` | Show tool-use progress updates while agent works |
 | `/noverbose` | Only show final results |
+| `/todomode` | Toggle Todoist write mode: confirm (inline keyboard) or yolo (auto-execute) |
 | `/ping` | Check if bot is online |
 | `/chatid` | Get chat ID for registration |
 

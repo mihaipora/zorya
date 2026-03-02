@@ -82,6 +82,23 @@ export interface EventProposal {
   resolved_at: string | null;
 }
 
+export interface TodoistProposal {
+  id: string;
+  action: 'create' | 'complete';
+  content: string;
+  description: string;
+  due_string: string;
+  project_name: string;
+  priority: number;
+  labels: string[];
+  todoist_task_id: string | null;
+  status: 'pending' | 'approved' | 'rejected' | 'expired';
+  telegram_message_id: string | null;
+  chat_jid: string;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 export interface TaskRunLog {
   task_id: string;
   run_at: string;

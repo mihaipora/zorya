@@ -1,0 +1,274 @@
+#!/usr/bin/env node
+'use strict';
+
+const http = require('http');
+
+// --- Config ---
+
+const DEFAULT_PORT = 8081;
+const HOSTS = ['host.docker.internal', '172.17.0.1'];
+
+// --- Helpers ---
+
+function die(msg) {
+  process.stderr.write(`Error: ${msg}\n`);
+  process.exit(1);
+}
+
+function parseArgs(argv) {
+  const args = { _: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--json') {
+      args.json = true;
+    } else if (arg === '--limit' && i + 1 < argv.length) {
+      args.limit = parseInt(argv[++i], 10);
+    } else if (arg === '--filter' && i + 1 < argv.length) {
+      args.filter = argv[++i];
+    } else if (!arg.startsWith('--')) {
+      args._.push(arg);
+    } else {
+      die(`Unknown flag: ${arg}`);
+    }
+  }
+  return args;
+}
+
+function httpGet(host, port, path) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: host, port, path, method: 'GET', timeout: 10000 },
+      (res) => {
+        let data = '';
+        res.on('data', (chunk) => (data += chunk));
+        res.on('end', () => resolve({ status: res.statusCode, body: data }));
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Request timed out'));
+    });
+    req.end();
+  });
+}
+
+async function resolveHost() {
+  const envHost = process.env.TOOLS_PROXY_HOST;
+  if (envHost) {
+    const [host, portStr] = envHost.includes(':') ? envHost.split(':') : [envHost, String(DEFAULT_PORT)];
+    return { host, port: parseInt(portStr, 10) || DEFAULT_PORT };
+  }
+
+  for (const host of HOSTS) {
+    try {
+      await httpGet(host, DEFAULT_PORT, '/todoist/health');
+      return { host, port: DEFAULT_PORT };
+    } catch {
+      // Try next host
+    }
+  }
+
+  die('Todoist proxy is not running. Check the host process.');
+}
+
+async function request(apiPath) {
+  const { host, port } = await resolveHost();
+  const res = await httpGet(host, port, apiPath);
+
+  if (res.status === 503) {
+    die('Todoist is not configured. Add TODOIST_API_TOKEN to .env on the host.');
+  }
+
+  if (res.status === 404) {
+    const data = JSON.parse(res.body);
+    die(data.error || 'Not found');
+  }
+
+  if (res.status === 400) {
+    const data = JSON.parse(res.body);
+    die(data.error || 'Bad request');
+  }
+
+  if (res.status !== 200) {
+    die(`Unexpected response (${res.status}): ${res.body}`);
+  }
+
+  return JSON.parse(res.body);
+}
+
+// --- Formatters ---
+
+const PRIORITY_LABELS = { 1: '', 2: 'low', 3: 'high', 4: 'urgent' };
+
+function formatTask(task) {
+  const parts = [`[ ] ${task.content}`];
+
+  const meta = [];
+  if (task.due) meta.push(`due: ${task.due.string || task.due.date}`);
+  if (task.priority > 1) meta.push(`priority: ${PRIORITY_LABELS[task.priority] || task.priority}`);
+  if (meta.length > 0) parts.push(`  (${meta.join(', ')})`);
+  parts.push(`  [id: ${task.id}]`);
+
+  const lines = [parts.join('')];
+
+  if (task.projectId) lines.push(`    Project: ${task.projectId}`);
+  if (task.labels && task.labels.length > 0) lines.push(`    Labels: ${task.labels.join(', ')}`);
+  if (task.description) lines.push(`    ${task.description}`);
+
+  return lines.join('\n');
+}
+
+function formatTasks(tasks) {
+  if (tasks.length === 0) {
+    process.stdout.write('No tasks found.\n');
+    return;
+  }
+
+  // Sort by due date (tasks without due date go last)
+  tasks.sort((a, b) => {
+    if (!a.due && !b.due) return 0;
+    if (!a.due) return 1;
+    if (!b.due) return -1;
+    return (a.due.date || '').localeCompare(b.due.date || '');
+  });
+
+  const lines = tasks.map(formatTask);
+  process.stdout.write(lines.join('\n') + '\n');
+}
+
+function formatProjects(projects) {
+  if (projects.length === 0) {
+    process.stdout.write('No projects found.\n');
+    return;
+  }
+
+  for (const p of projects) {
+    process.stdout.write(`${p.name}  [id: ${p.id}]\n`);
+  }
+}
+
+// --- Commands ---
+
+async function cmdList(args) {
+  const params = new URLSearchParams();
+  if (args.filter) params.set('filter', args.filter);
+  if (args.limit) params.set('limit', String(args.limit));
+
+  const qs = params.toString();
+  const data = await request(`/todoist/tasks${qs ? '?' + qs : ''}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatTasks(data);
+  }
+}
+
+async function cmdSearch(args) {
+  const keyword = args._[1];
+  if (!keyword) die('Usage: todoist search <keyword> [--limit N] [--json]');
+
+  const params = new URLSearchParams({ filter: `search: ${keyword}` });
+  if (args.limit) params.set('limit', String(args.limit));
+
+  const data = await request(`/todoist/tasks?${params.toString()}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatTasks(data);
+  }
+}
+
+async function cmdGet(args) {
+  const taskId = args._[1];
+  if (!taskId) die('Usage: todoist get <task-id> [--json]');
+
+  const data = await request(`/todoist/tasks/${taskId}`);
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    process.stdout.write(formatTask(data) + '\n');
+  }
+}
+
+async function cmdProjects(args) {
+  const data = await request('/todoist/projects');
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    formatProjects(data);
+  }
+}
+
+async function cmdHealth(args) {
+  const data = await request('/todoist/health');
+
+  if (args.json) {
+    process.stdout.write(JSON.stringify(data, null, 2) + '\n');
+  } else {
+    process.stdout.write(`Status: ${data.status}\nConfigured: ${data.configured}\n`);
+  }
+}
+
+// --- Usage ---
+
+function printUsage() {
+  const usage = `Usage: todoist <command> [options]
+
+Commands:
+  list [--filter "..."]     List active tasks (optionally filtered)
+  search <keyword>          Search tasks by keyword
+  get <task-id>             Get a single task by ID
+  projects                  List all projects
+  health                    Check if Todoist proxy is running
+
+Flags:
+  --json         Output raw JSON instead of formatted text
+  --limit N      Max results (default: 50)
+  --filter "..." Todoist filter syntax (e.g., "due before: Apr 1", "p1 | p2")
+
+Examples:
+  todoist list
+  todoist list --filter "due before: Apr 1"
+  todoist list --filter "p1 | p2"
+  todoist search "EU funding"
+  todoist projects
+`;
+  process.stderr.write(usage);
+  process.exit(1);
+}
+
+// --- Main ---
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const command = args._[0];
+
+  if (!command) printUsage();
+
+  switch (command) {
+    case 'list':
+      return cmdList(args);
+    case 'search':
+      return cmdSearch(args);
+    case 'get':
+      return cmdGet(args);
+    case 'projects':
+      return cmdProjects(args);
+    case 'health':
+      return cmdHealth(args);
+    default:
+      die(`Unknown command: ${command}\nAvailable: list, search, get, projects, health`);
+  }
+}
+
+main().catch((err) => {
+  if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+    die('Todoist proxy is not running. Check the host process.');
+  }
+  die(err.message || String(err));
+});

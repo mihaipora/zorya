@@ -10,10 +10,12 @@ import {
   TIMEZONE,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
-import { createEventProposal, createTask, deleteTask, getTaskById, updateEventProposal, updateTask } from './db.js';
+import { createEventProposal, createTask, createTodoistProposal, deleteTask, getTaskById, updateEventProposal, updateTodoistProposal, updateTask } from './db.js';
+import { getRouterState } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { EventProposal, RegisteredGroup } from './types.js';
+import { createTodoistTask, closeTodoistTask, resolveProjectId } from './todoist.js';
+import { EventProposal, RegisteredGroup, TodoistProposal } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
@@ -28,6 +30,7 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   sendEventProposal?: (jid: string, proposal: EventProposal) => Promise<string | undefined>;
+  sendTodoistProposal?: (jid: string, proposal: TodoistProposal) => Promise<string | undefined>;
 }
 
 let ipcWatcherRunning = false;
@@ -149,6 +152,23 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       );
                     }
                   }
+                }
+              } else if (
+                (data.type === 'todoist_create' || data.type === 'todoist_complete') &&
+                data.chatJid
+              ) {
+                // Authorization check
+                const targetGroup = registeredGroups[data.chatJid];
+                if (
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup)
+                ) {
+                  await processTodoistIpc(data, deps);
+                } else {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized todoist IPC attempt blocked',
+                  );
                 }
               }
               fs.unlinkSync(filePath);
@@ -443,5 +463,133 @@ export async function processTaskIpc(
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
+  }
+}
+
+// --- Todoist IPC handler ---
+
+async function processTodoistIpc(
+  data: Record<string, unknown>,
+  deps: IpcDeps,
+): Promise<void> {
+  const chatJid = data.chatJid as string;
+  const mode = getRouterState(`todo_mode:${chatJid}`) || 'confirm';
+
+  if (data.type === 'todoist_create') {
+    const content = (data.content as string) || '';
+    if (!content.trim()) {
+      logger.warn('Todoist create: missing content');
+      return;
+    }
+
+    // Resolve project name to ID if provided
+    let projectId: string | undefined;
+    const projectName = (data.project_name as string) || '';
+    if (projectName) {
+      const resolved = await resolveProjectId(projectName);
+      if (resolved) {
+        projectId = resolved;
+      } else {
+        logger.warn({ projectName }, 'Todoist: project not found, creating without project');
+      }
+    }
+
+    if (mode === 'yolo') {
+      try {
+        const task = await createTodoistTask({
+          content,
+          description: (data.description as string) || undefined,
+          dueString: (data.due_string as string) || undefined,
+          projectId,
+          priority: (data.priority as number) || undefined,
+          labels: (data.labels as string[]) || undefined,
+        });
+        await deps.sendMessage(chatJid, `✅ Todo created: "${task.content}"`);
+        logger.info({ taskId: task.id, content }, 'Todoist task created (yolo)');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ err }, 'Todoist create failed');
+        await deps.sendMessage(chatJid, `❌ Failed to create todo: ${msg}`);
+      }
+    } else {
+      // Confirm mode: create proposal + send inline keyboard
+      const proposalId = `todo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const proposal: TodoistProposal = {
+        id: proposalId,
+        action: 'create',
+        content,
+        description: (data.description as string) || '',
+        due_string: (data.due_string as string) || '',
+        project_name: projectName,
+        priority: (data.priority as number) || 1,
+        labels: (data.labels as string[]) || [],
+        todoist_task_id: null,
+        status: 'pending',
+        telegram_message_id: null,
+        chat_jid: chatJid,
+        created_at: new Date().toISOString(),
+        resolved_at: null,
+      };
+
+      createTodoistProposal(proposal);
+
+      if (deps.sendTodoistProposal) {
+        const msgId = await deps.sendTodoistProposal(chatJid, proposal);
+        if (msgId) {
+          updateTodoistProposal(proposalId, { telegram_message_id: msgId });
+        }
+      }
+
+      logger.info({ proposalId, content }, 'Todoist create proposal sent');
+    }
+  } else if (data.type === 'todoist_complete') {
+    const taskId = (data.taskId as string) || '';
+    const taskTitle = (data.taskTitle as string) || '';
+    if (!taskId) {
+      logger.warn('Todoist complete: missing taskId');
+      return;
+    }
+
+    if (mode === 'yolo') {
+      try {
+        await closeTodoistTask(taskId);
+        await deps.sendMessage(chatJid, `✅ Todo completed: "${taskTitle}"`);
+        logger.info({ taskId, taskTitle }, 'Todoist task completed (yolo)');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error({ err }, 'Todoist complete failed');
+        await deps.sendMessage(chatJid, `❌ Failed to complete todo: ${msg}`);
+      }
+    } else {
+      // Confirm mode: create proposal + send inline keyboard
+      const proposalId = `todo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const proposal: TodoistProposal = {
+        id: proposalId,
+        action: 'complete',
+        content: taskTitle,
+        description: '',
+        due_string: '',
+        project_name: '',
+        priority: 1,
+        labels: [],
+        todoist_task_id: taskId,
+        status: 'pending',
+        telegram_message_id: null,
+        chat_jid: chatJid,
+        created_at: new Date().toISOString(),
+        resolved_at: null,
+      };
+
+      createTodoistProposal(proposal);
+
+      if (deps.sendTodoistProposal) {
+        const msgId = await deps.sendTodoistProposal(chatJid, proposal);
+        if (msgId) {
+          updateTodoistProposal(proposalId, { telegram_message_id: msgId });
+        }
+      }
+
+      logger.info({ proposalId, taskId, taskTitle }, 'Todoist complete proposal sent');
+    }
   }
 }

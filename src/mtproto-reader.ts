@@ -1,11 +1,11 @@
 /**
- * MTProto Reader — HTTP server for read-only Telegram access
+ * MTProto Reader — GramJS client + route handlers for read-only Telegram access
  *
- * Holds the GramJS MTProto session and exposes read-only endpoints.
+ * Holds the GramJS MTProto session and provides route handlers for the tools proxy.
  * The agent calls this from inside the container via the telegram-reader CLI tool.
  *
- * Integrated into the main NanoClaw process via startMtprotoReader/stopMtprotoReader.
- * Self-contained with no shared mutable state — ready for Worker thread extraction.
+ * Lifecycle: connectMtproto/disconnectMtproto
+ * Route handler: handleMtprotoRequest (registered with tools-proxy)
  */
 import fs from 'fs';
 import http from 'http';
@@ -19,11 +19,9 @@ import { StringSession } from 'telegram/sessions/index.js';
 import { MTPROTO_API_ID, MTPROTO_API_HASH, DATA_DIR } from './config.js';
 import { logger } from './logger.js';
 
-const PORT = 8081;
-
 // Module-level refs for lifecycle management
-let _server: http.Server | null = null;
 let _client: TelegramClient | null = null;
+let _myName = 'Me';
 
 // --- Types ---
 
@@ -327,18 +325,49 @@ async function handleConversation(
 async function handleHealth(
   _req: http.IncomingMessage,
   res: http.ServerResponse,
-  myName: string,
 ): Promise<void> {
   jsonResponse(res, 200, {
     status: 'ok',
     connected: _client?.connected ?? false,
-    user: myName,
+    user: _myName,
   });
+}
+
+// --- Exported route handler ---
+
+export async function handleMtprotoRequest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+): Promise<void> {
+  const url = new URL(req.url!, 'http://localhost');
+  const pathname = url.pathname;
+
+  if (req.method !== 'GET') {
+    errorResponse(res, 404, 'Not found');
+    return;
+  }
+
+  if (pathname === '/health') {
+    await handleHealth(req, res);
+  } else if (pathname === '/pending-replies') {
+    await handlePendingReplies(req, res);
+  } else if (pathname === '/conversations') {
+    await handleConversations(req, res);
+  } else if (pathname.startsWith('/conversation/')) {
+    const chatIdStr = pathname.slice('/conversation/'.length);
+    if (!chatIdStr || !/^-?\d+$/.test(chatIdStr)) {
+      errorResponse(res, 400, 'Invalid chat ID');
+      return;
+    }
+    await handleConversation(req, res, chatIdStr);
+  } else {
+    errorResponse(res, 404, 'Not found');
+  }
 }
 
 // --- Exported lifecycle functions ---
 
-export async function startMtprotoReader(): Promise<void> {
+export async function connectMtproto(): Promise<void> {
   if (!MTPROTO_API_ID || !MTPROTO_API_HASH) {
     logger.info('MTProto Reader not configured, skipping');
     return;
@@ -365,59 +394,14 @@ export async function startMtprotoReader(): Promise<void> {
     _client = client;
 
     const me = await client.getMe() as Api.User;
-    const myName = me.firstName || me.username || 'Me';
-    logger.info({ user: myName }, 'MTProto Reader: connected');
-
-    // --- HTTP server ---
-
-    const server = http.createServer(async (req, res) => {
-      const url = new URL(req.url!, `http://localhost`);
-      const pathname = url.pathname;
-
-      if (req.method !== 'GET') {
-        errorResponse(res, 404, 'Not found');
-        return;
-      }
-
-      try {
-        if (pathname === '/health') {
-          await handleHealth(req, res, myName);
-        } else if (pathname === '/pending-replies') {
-          await handlePendingReplies(req, res);
-        } else if (pathname === '/conversations') {
-          await handleConversations(req, res);
-        } else if (pathname.startsWith('/conversation/')) {
-          const chatIdStr = pathname.slice('/conversation/'.length);
-          if (!chatIdStr || !/^-?\d+$/.test(chatIdStr)) {
-            errorResponse(res, 400, 'Invalid chat ID');
-            return;
-          }
-          await handleConversation(req, res, chatIdStr);
-        } else {
-          errorResponse(res, 404, 'Not found');
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.error({ pathname, err }, 'MTProto Reader: request error');
-        errorResponse(res, 500, message);
-      }
-    });
-
-    _server = server;
-
-    server.listen(PORT, '127.0.0.1', () => {
-      logger.info({ port: PORT }, 'MTProto Reader: HTTP server listening');
-    });
+    _myName = me.firstName || me.username || 'Me';
+    logger.info({ user: _myName }, 'MTProto Reader: connected');
   } catch (err) {
     logger.error({ err }, 'MTProto Reader failed to start');
   }
 }
 
-export async function stopMtprotoReader(): Promise<void> {
-  if (_server) {
-    _server.close();
-    _server = null;
-  }
+export async function disconnectMtproto(): Promise<void> {
   if (_client) {
     try {
       await _client.disconnect();

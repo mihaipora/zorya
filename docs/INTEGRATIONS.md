@@ -8,6 +8,7 @@ All integrations beyond the core Telegram bot are optional. The agent works with
 |---|---|---|
 | [Google API](#google-api) | Gmail reading, calendar reading, event creation | OAuth script + GCP project |
 | [Calendar approval](#calendar-approval) | Inline keyboard approval for calendar events | Automatic (after Google API) |
+| [Todoist](#todoist) | Read tasks, create/complete with approval | Add API token to `.env` |
 | [Telegram conversations](#telegram-conversations) | Read personal Telegram message history | MTProto setup script |
 | [Voice transcription](#voice-transcription) | Transcribe Telegram voice messages to text | Add API key to `.env` |
 | [Browser automation](#browser-automation) | Web browsing, form filling, data extraction | Baked into container |
@@ -84,6 +85,86 @@ Agent detects scheduling intent
 ```
 
 Proposals expire after 24 hours.
+
+## Todoist
+
+Read and manage Todoist tasks. Reads go through a host-side HTTP proxy; writes go through IPC with optional user approval.
+
+**How it works:**
+
+```
+READS:
+  Agent runs todoist CLI inside container
+    → CLI calls host HTTP proxy at localhost:8081/todoist/*
+    → host calls Todoist API via official SDK (@doist/todoist-api-typescript)
+    → returns task list, project list, or single task
+
+WRITES:
+  Agent calls create_todo or complete_todo MCP tool
+    → writes IPC file to /workspace/ipc/messages/
+    → host reads IPC file, checks mode:
+      Yolo:    calls Todoist API directly, sends confirmation message
+      Confirm: saves proposal to DB, sends inline keyboard to Telegram:
+
+        📋 Buy groceries
+        Due: Friday
+        Priority: high
+
+        [✅ Create]  [❌ Skip]
+
+      → user taps Create → host calls Todoist API → task created
+      → user taps Skip → proposal dismissed
+```
+
+The API token stays on the host. The container CLI is a thin HTTP client that never sees credentials.
+
+Available CLI commands (inside container):
+
+```bash
+todoist list                              # all active tasks
+todoist list --filter "due today"         # Todoist filter syntax
+todoist list --filter "p1 | p2"           # high priority tasks
+todoist search "groceries"                # keyword search
+todoist get <task-id>                     # single task details
+todoist projects                          # list all projects
+todoist health                            # check proxy connection
+```
+
+All commands support `--json` for structured output and `--limit N` to cap results.
+
+MCP tools for writes:
+- `create_todo` — content, description, due_string, project_name, priority, labels
+- `complete_todo` — taskId, taskTitle
+
+**Prerequisites:** A Todoist API token from https://app.todoist.com/app/settings/integrations/developer.
+
+**Setup:** Add to `.env`:
+
+```
+TODOIST_API_TOKEN=<your-token>
+```
+
+**Restart required** to pick up the token:
+
+```bash
+# macOS
+launchctl kickstart -k gui/$(id -u)/com.nanoclaw
+
+# Linux
+systemctl --user restart nanoclaw
+```
+
+**Verify:**
+
+```bash
+curl http://127.0.0.1:8081/todoist/health
+```
+
+**Write mode:** Toggle between confirm (default) and yolo via `/todomode` in Telegram. In confirm mode, every create/complete shows an inline keyboard for approval. In yolo mode, writes execute immediately.
+
+Proposals expire after 24 hours if not acted on.
+
+**Security:** The Todoist API token is read-write with no scope restrictions. It never enters the container — all API calls go through the host HTTP proxy. Write operations require explicit user approval (in confirm mode) or opt-in auto-execute (yolo mode).
 
 ## Telegram Conversations
 

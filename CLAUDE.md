@@ -17,6 +17,9 @@ Single Node.js process that connects to WhatsApp, routes messages to Claude Agen
 | `src/config.ts` | Trigger pattern, paths, intervals |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
+| `src/tools-proxy.ts` | HTTP proxy server (port 8081) for container tool APIs |
+| `src/mtproto-reader.ts` | GramJS client + Telegram read-only route handlers |
+| `src/todoist.ts` | Todoist API client + HTTP route handler |
 | `src/db.ts` | SQLite operations |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
@@ -54,6 +57,26 @@ systemctl --user start nanoclaw
 systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
 ```
+
+## Tool Integration Patterns
+
+When integrating with external APIs, prefer official SDK libraries over raw `fetch` calls. Libraries handle auth headers, retries, type safety, and API versioning. Only fall back to raw HTTP when no maintained library exists.
+
+Container tools that need API tokens follow one of two patterns depending on the token's permissions:
+
+**Read-only tokens** (e.g., `gmail.readonly` OAuth scope): Mount credentials into container. CLI tool calls API directly.
+- Example: `google-api` reads `~/.google-oauth/oauth.json` from mount at `/workspace/extra/google-oauth/`
+
+**Read-write tokens** (e.g., Todoist API token, MTProto session): Token stays on host only. Host exposes HTTP proxy on `localhost:8081`. Container CLI tool calls the proxy.
+- Example: `telegram-reader` calls `localhost:8081/conversations`
+- `src/tools-proxy.ts` owns the HTTP server, dispatches by path prefix to tool modules
+- Each tool module exports a route handler (e.g., `src/mtproto-reader.ts`, `src/todoist.ts`)
+- To add a new tool: create handler module, register prefix in `src/index.ts`
+
+**Write operations with user approval**: Use MCP tools via IPC (pattern: `propose_event`).
+- Agent calls MCP tool → writes IPC file → host processes it
+- Host checks mode (yolo/confirm) → executes directly or sends inline keyboard
+- Confirmation state stored in `router_state` table
 
 ## Container Build Cache
 

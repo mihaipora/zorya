@@ -62,7 +62,8 @@ A personal Claude assistant accessible via WhatsApp, with persistent memory per 
 │  │    • Read, Write, Edit, Glob, Grep (file operations)           │   │
 │  │    • WebSearch, WebFetch (internet access)                     │   │
 │  │    • agent-browser (browser automation)                        │   │
-│  │    • mcp__nanoclaw__* (scheduler tools via IPC)                │   │
+│  │    • todoist (CLI — reads tasks/projects via host proxy)       │   │
+│  │    • mcp__nanoclaw__* (scheduler, todo, calendar via IPC)     │   │
 │  │                                                                │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
@@ -108,6 +109,9 @@ nanoclaw/
 │   ├── logger.ts                  # Pino logger setup
 │   ├── db.ts                      # SQLite database initialization and queries
 │   ├── group-queue.ts             # Per-group queue with global concurrency limit
+│   ├── tools-proxy.ts             # Shared HTTP proxy (port 8081) for container tool APIs
+│   ├── todoist.ts                 # Todoist API client + HTTP route handler
+│   ├── mtproto-reader.ts          # GramJS client + Telegram read-only route handlers
 │   ├── mount-security.ts          # Mount allowlist validation for containers
 │   ├── whatsapp-auth.ts           # Standalone WhatsApp authentication
 │   ├── task-scheduler.ts          # Runs scheduled tasks when due
@@ -122,6 +126,10 @@ nanoclaw/
 │   │   └── src/
 │   │       ├── index.ts           # Entry point (query loop, IPC polling, session resume)
 │   │       └── ipc-mcp-stdio.ts   # Stdio-based MCP server for host communication
+│   ├── tools/
+│   │   ├── google-api             # Gmail + Calendar CLI (read-only)
+│   │   ├── telegram-reader        # Telegram conversation reader CLI
+│   │   └── todoist                # Todoist task reader CLI
 │   └── skills/
 │       └── agent-browser.md       # Browser automation skill
 │
@@ -473,7 +481,10 @@ The `nanoclaw` MCP server is created dynamically per agent call with the current
 | `pause_task` | Pause a task |
 | `resume_task` | Resume a paused task |
 | `cancel_task` | Delete a task |
-| `send_message` | Send a WhatsApp message to the group |
+| `send_message` | Send a message to the group |
+| `propose_event` | Propose a calendar event for user approval |
+| `create_todo` | Create a Todoist task (confirm or yolo mode) |
+| `complete_todo` | Complete a Todoist task (confirm or yolo mode) |
 
 ---
 
@@ -588,6 +599,7 @@ WhatsApp messages could contain malicious instructions attempting to manipulate 
 |------------|------------------|-------|
 | Claude CLI Auth | data/sessions/{group}/.claude/ | Per-group isolation, mounted to /home/node/.claude/ |
 | WhatsApp Session | store/auth/ | Auto-created, persists ~20 days |
+| Todoist API Token | .env (`TODOIST_API_TOKEN`) | Host-only, never mounted into containers |
 
 ### File Permissions
 

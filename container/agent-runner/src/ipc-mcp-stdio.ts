@@ -327,6 +327,60 @@ server.tool(
   },
 );
 
+server.tool(
+  'create_todo',
+  `Create a Todoist task. In confirm mode, the user sees an inline keyboard to approve or skip. In yolo mode, the task is created immediately. Include all relevant details.`,
+  {
+    content: z.string().describe('Task title/content'),
+    description: z.string().optional().describe('Task description with additional details'),
+    due_string: z.string().optional().describe('Due date in natural language (e.g., "Friday", "tomorrow", "Mar 15")'),
+    project_name: z.string().optional().describe('Project name (e.g., "Work", "Personal"). Resolved to project ID by host.'),
+    priority: z.number().min(1).max(4).optional().describe('Priority: 1=normal, 2=low, 3=high, 4=urgent'),
+    labels: z.array(z.string()).optional().describe('Label names to apply'),
+  },
+  async (args) => {
+    const data = {
+      type: 'todoist_create',
+      chatJid,
+      groupFolder,
+      content: args.content,
+      description: args.description || '',
+      due_string: args.due_string || '',
+      project_name: args.project_name || '',
+      priority: args.priority || 1,
+      labels: args.labels || [],
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Todo proposed: "${args.content}"` }] };
+  },
+);
+
+server.tool(
+  'complete_todo',
+  `Mark a Todoist task as complete. In confirm mode, the user approves via inline keyboard. In yolo mode, the task is completed immediately. Use the todoist CLI to find the task ID first.`,
+  {
+    taskId: z.string().describe('Todoist task ID'),
+    taskTitle: z.string().describe('Task title (for display in confirmation message)'),
+  },
+  async (args) => {
+    const data = {
+      type: 'todoist_complete',
+      chatJid,
+      groupFolder,
+      taskId: args.taskId,
+      taskTitle: args.taskTitle,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Todo completion proposed: "${args.taskTitle}"` }] };
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

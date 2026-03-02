@@ -35,6 +35,7 @@ Example progress update: "Found 3 bakeries so far, checking if they actually sel
 - **Read calendar** and check availability via the `google-api` CLI
 - **Propose calendar events** via the `propose_event` MCP tool — the user approves with a tap
 - **Check Telegram conversations** via the `telegram-reader` CLI
+- **Manage Todoist tasks** — read via the `todoist` CLI, create/complete via MCP tools with user approval
 
 ---
 
@@ -132,6 +133,66 @@ propose_event(
 ```
 
 After calling `propose_event`, tell the user you've sent the proposal and they can approve it in Telegram.
+
+---
+
+## Todoist Tasks
+
+### Reading Tasks (CLI)
+
+Use the `todoist` CLI to read tasks and projects:
+
+```bash
+# List all active tasks
+todoist list
+
+# Search tasks with Todoist filter syntax
+todoist search "due today"
+todoist search "p1 | p2"
+todoist search "search: groceries"
+
+# Get a specific task by ID
+todoist get <task-id>
+
+# List all projects
+todoist projects
+
+# All commands support --json for structured output
+todoist list --json --limit 5
+```
+
+### Creating & Completing Tasks (MCP)
+
+You **cannot** create or complete tasks directly. Use MCP tools — the user controls whether tasks are auto-created or require approval (via `/todomode` in Telegram).
+
+**Create a task:**
+```
+create_todo(
+  content: "Buy groceries",
+  due_string: "tomorrow",
+  project_name: "Personal",
+  priority: 2,
+  labels: ["errands"]
+)
+```
+
+**Complete a task:**
+```
+complete_todo(
+  taskId: "8234567890",
+  taskTitle: "Buy groceries"
+)
+```
+
+Parameters for `create_todo`:
+- `content` (required): Task title
+- `description` (optional): Additional details
+- `due_string` (optional): Natural language due date ("tomorrow", "Friday", "Mar 15")
+- `project_name` (optional): Project name — resolved to ID automatically
+- `priority` (optional): 1=normal, 2=low, 3=high, 4=urgent
+- `labels` (optional): Array of label names
+
+After calling a todo MCP tool, tell the user the proposal was sent. In confirm mode they'll see an inline keyboard to approve/skip.
 
 ---
 

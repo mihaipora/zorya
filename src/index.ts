@@ -24,6 +24,7 @@ import {
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import {
   expireStaleProposals,
+  expireStaleTodoistProposals,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -32,6 +33,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getTodoistProposal,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -39,6 +41,7 @@ import {
   storeChatMetadata,
   storeMessage,
   updateEventProposal,
+  updateTodoistProposal,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
@@ -46,7 +49,9 @@ import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
-import { startMtprotoReader, stopMtprotoReader } from './mtproto-reader.js';
+import { connectMtproto, disconnectMtproto, handleMtprotoRequest } from './mtproto-reader.js';
+import { createTodoistTask, closeTodoistTask, handleTodoistRequest, resolveProjectId } from './todoist.js';
+import { registerRoutes, startToolsProxy, stopToolsProxy } from './tools-proxy.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -434,7 +439,8 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
-    await stopMtprotoReader();
+    stopToolsProxy();
+    await disconnectMtproto();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);
@@ -508,6 +514,75 @@ async function main(): Promise<void> {
           try { await ctx.answerCallbackQuery('Error processing request'); } catch { /* ignore */ }
         }
       },
+      onTodoCallback: async (proposalId, action, ctx) => {
+        try {
+          const proposal = getTodoistProposal(proposalId);
+          if (!proposal || proposal.status !== 'pending') {
+            await ctx.answerCallbackQuery('This proposal has already been handled.');
+            return;
+          }
+
+          const age = Date.now() - new Date(proposal.created_at).getTime();
+          if (age > 24 * 60 * 60 * 1000) {
+            updateTodoistProposal(proposalId, { status: 'expired', resolved_at: new Date().toISOString() });
+            await ctx.editMessageText('⏰ Proposal expired');
+            await ctx.answerCallbackQuery('Expired');
+            return;
+          }
+
+          if (action === 'approve') {
+            try {
+              if (proposal.action === 'create') {
+                let projectId: string | undefined;
+                if (proposal.project_name) {
+                  projectId = (await resolveProjectId(proposal.project_name)) ?? undefined;
+                }
+                const task = await createTodoistTask({
+                  content: proposal.content,
+                  description: proposal.description || undefined,
+                  dueString: proposal.due_string || undefined,
+                  projectId,
+                  priority: proposal.priority || undefined,
+                  labels: proposal.labels.length > 0 ? proposal.labels : undefined,
+                });
+                updateTodoistProposal(proposalId, { status: 'approved', resolved_at: new Date().toISOString() });
+                await ctx.editMessageText(`✅ Todo created: "${task.content}"`);
+              } else {
+                await closeTodoistTask(proposal.todoist_task_id!);
+                updateTodoistProposal(proposalId, { status: 'approved', resolved_at: new Date().toISOString() });
+                await ctx.editMessageText(`✅ Todo completed: "${proposal.content}"`);
+              }
+              await ctx.answerCallbackQuery('Done!');
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              logger.error({ proposalId, err }, 'Failed to execute todoist action');
+              await ctx.editMessageText(`❌ Failed: ${msg}`);
+              await ctx.answerCallbackQuery('Failed');
+            }
+          } else if (action === 'skip') {
+            updateTodoistProposal(proposalId, { status: 'rejected', resolved_at: new Date().toISOString() });
+            await ctx.editMessageText(`❌ Skipped: ${proposal.content}`);
+            await ctx.answerCallbackQuery('Skipped');
+          }
+        } catch (err) {
+          logger.error({ proposalId, err }, 'Error handling todo callback');
+          try { await ctx.answerCallbackQuery('Error processing request'); } catch { /* ignore */ }
+        }
+      },
+      onTodoModeChange: async (chatJid, mode, ctx) => {
+        try {
+          if (mode !== 'yolo' && mode !== 'confirm') {
+            await ctx.answerCallbackQuery('Invalid mode');
+            return;
+          }
+          setRouterState(`todo_mode:${chatJid}`, mode);
+          await ctx.editMessageText(`Todo mode: *${mode}*`, { parse_mode: 'Markdown' });
+          await ctx.answerCallbackQuery(`Switched to ${mode}`);
+        } catch (err) {
+          logger.error({ chatJid, mode, err }, 'Error changing todo mode');
+          try { await ctx.answerCallbackQuery('Error'); } catch { /* ignore */ }
+        }
+      },
     });
     channels.push(telegram);
     await telegram.connect();
@@ -542,15 +617,26 @@ async function main(): Promise<void> {
       if (!channel || !(channel instanceof TelegramChannel)) return undefined;
       return channel.sendEventProposal(jid, proposal);
     },
+    sendTodoistProposal: async (jid, proposal) => {
+      const channel = findChannel(channels, jid);
+      if (!channel || !(channel instanceof TelegramChannel)) return undefined;
+      return channel.sendTodoistProposal(jid, proposal);
+    },
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
 
-  // Start MTProto Reader after channels — GramJS failure must not block bot startup
-  await startMtprotoReader();
+  // Start tools proxy + MTProto client after channels — failures must not block bot startup
+  await connectMtproto();
+  registerRoutes('/todoist', handleTodoistRequest);
+  registerRoutes('/', handleMtprotoRequest);
+  startToolsProxy();
 
-  // Expire stale event proposals every hour
-  setInterval(() => expireStaleProposals(), 60 * 60 * 1000);
+  // Expire stale proposals every hour
+  setInterval(() => {
+    expireStaleProposals();
+    expireStaleTodoistProposals();
+  }, 60 * 60 * 1000);
 
   startMessageLoop();
 }

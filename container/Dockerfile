@@ -65,6 +65,9 @@ RUN chmod +x /usr/local/bin/google-api
 COPY tools/telegram-reader /usr/local/bin/telegram-reader
 RUN chmod +x /usr/local/bin/telegram-reader
 
+COPY tools/todoist /usr/local/bin/todoist
+RUN chmod +x /usr/local/bin/todoist
+
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 

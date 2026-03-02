@@ -5,7 +5,7 @@ import path from 'path';
 import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { EventProposal, NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog } from './types.js';
+import { EventProposal, NewMessage, RegisteredGroup, ScheduledTask, TaskRunLog, TodoistProposal } from './types.js';
 
 let db: Database.Database;
 
@@ -86,6 +86,24 @@ function createSchema(database: Database.Database): void {
       attendees TEXT DEFAULT '[]',
       description TEXT DEFAULT '',
       location TEXT DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending'
+          CHECK(status IN ('pending', 'approved', 'rejected', 'expired')),
+      telegram_message_id TEXT,
+      chat_jid TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS todoist_proposals (
+      id TEXT PRIMARY KEY,
+      action TEXT NOT NULL CHECK(action IN ('create', 'complete')),
+      content TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      due_string TEXT DEFAULT '',
+      project_name TEXT DEFAULT '',
+      priority INTEGER DEFAULT 1,
+      labels TEXT DEFAULT '[]',
+      todoist_task_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending'
           CHECK(status IN ('pending', 'approved', 'rejected', 'expired')),
       telegram_message_id TEXT,
@@ -679,6 +697,74 @@ export function expireStaleProposals(): void {
   const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   db.prepare(
     `UPDATE event_proposals SET status = 'expired', resolved_at = ? WHERE status = 'pending' AND created_at < ?`,
+  ).run(new Date().toISOString(), cutoff);
+}
+
+// --- Todoist proposals ---
+
+export function createTodoistProposal(proposal: Omit<TodoistProposal, 'resolved_at' | 'telegram_message_id'>): void {
+  db.prepare(
+    `INSERT INTO todoist_proposals (id, action, content, description, due_string, project_name, priority, labels, todoist_task_id, status, chat_jid, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    proposal.id,
+    proposal.action,
+    proposal.content,
+    proposal.description,
+    proposal.due_string,
+    proposal.project_name,
+    proposal.priority,
+    JSON.stringify(proposal.labels),
+    proposal.todoist_task_id,
+    proposal.status,
+    proposal.chat_jid,
+    proposal.created_at,
+  );
+}
+
+export function getTodoistProposal(id: string): TodoistProposal | undefined {
+  const row = db.prepare('SELECT * FROM todoist_proposals WHERE id = ?').get(id) as
+    | (Omit<TodoistProposal, 'labels'> & { labels: string })
+    | undefined;
+  if (!row) return undefined;
+  return {
+    ...row,
+    labels: JSON.parse(row.labels),
+  };
+}
+
+export function updateTodoistProposal(
+  id: string,
+  updates: Partial<Pick<TodoistProposal, 'status' | 'telegram_message_id' | 'resolved_at'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.telegram_message_id !== undefined) {
+    fields.push('telegram_message_id = ?');
+    values.push(updates.telegram_message_id);
+  }
+  if (updates.resolved_at !== undefined) {
+    fields.push('resolved_at = ?');
+    values.push(updates.resolved_at);
+  }
+
+  if (fields.length === 0) return;
+
+  values.push(id);
+  db.prepare(
+    `UPDATE todoist_proposals SET ${fields.join(', ')} WHERE id = ?`,
+  ).run(...values);
+}
+
+export function expireStaleTodoistProposals(): void {
+  const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+  db.prepare(
+    `UPDATE todoist_proposals SET status = 'expired', resolved_at = ? WHERE status = 'pending' AND created_at < ?`,
   ).run(new Date().toISOString(), cutoff);
 }
 

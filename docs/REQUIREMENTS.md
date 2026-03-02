@@ -159,6 +159,14 @@ A personal Claude assistant accessible via WhatsApp, with minimal custom code.
 - Screenshots, PDFs, video recording
 - Authentication state persistence
 
+### Todoist
+- Task management via official `@doist/todoist-api-typescript` SDK
+- API token stays on host, exposed via HTTP proxy on port 8081 (same server as MTProto reader)
+- Container CLI (`todoist`) for reads: list tasks, search, get task, list projects
+- MCP tools (`create_todo`, `complete_todo`) for writes via IPC
+- Two write modes: **confirm** (inline keyboard approval) and **yolo** (auto-execute), toggled via `/todomode`
+- Proposals stored in `todoist_proposals` table, expire after 24 hours
+
 ---
 
 ## Setup & Customization

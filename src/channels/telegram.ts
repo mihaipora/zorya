@@ -11,6 +11,7 @@ import {
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
+  TodoistProposal,
 } from '../types.js';
 
 export interface TelegramChannelOpts {
@@ -19,6 +20,8 @@ export interface TelegramChannelOpts {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getStatus?: () => QueueStatus;
   onEventCallback?: (proposalId: string, action: string, ctx: any) => Promise<void>;
+  onTodoCallback?: (proposalId: string, action: string, ctx: any) => Promise<void>;
+  onTodoModeChange?: (chatJid: string, mode: string, ctx: any) => Promise<void>;
 }
 
 export class TelegramChannel implements Channel {
@@ -67,6 +70,19 @@ export class TelegramChannel implements Channel {
       const chatJid = `tg:${ctx.chat.id}`;
       setRouterState(`verbose:${chatJid}`, 'false');
       ctx.reply('Verbose mode *off* — only text messages and results.', { parse_mode: 'Markdown' });
+    });
+
+    // Todo mode toggle
+    this.bot.command('todomode', (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const current = getRouterState(`todo_mode:${chatJid}`) || 'confirm';
+      const keyboard = new InlineKeyboard()
+        .text(current === 'yolo' ? '✅ Yolo (auto-execute)' : 'Yolo (auto-execute)', 'todo:mode:yolo')
+        .text(current === 'confirm' ? '✅ Confirm (approve each)' : 'Confirm (approve each)', 'todo:mode:confirm');
+      ctx.reply(`Todo mode: *${current}*\nSelect a mode:`, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
     });
 
     this.bot.command('status', (ctx) => {
@@ -118,14 +134,26 @@ export class TelegramChannel implements Channel {
       ctx.reply(lines.join('\n'), { parse_mode: 'Markdown' });
     });
 
-    // Handle inline keyboard callbacks (event proposals, etc.)
+    // Handle inline keyboard callbacks (event proposals, todo proposals, mode toggles)
     this.bot.on('callback_query:data', async (ctx) => {
       const data = ctx.callbackQuery.data;
-      if (!data?.startsWith('event:')) return;
 
-      const [, action, proposalId] = data.split(':');
-      if (this.opts.onEventCallback) {
-        await this.opts.onEventCallback(proposalId, action, ctx);
+      if (data?.startsWith('event:')) {
+        const [, action, proposalId] = data.split(':');
+        if (this.opts.onEventCallback) {
+          await this.opts.onEventCallback(proposalId, action, ctx);
+        }
+      } else if (data?.startsWith('todo:mode:') && ctx.chat) {
+        const mode = data.split(':')[2]; // 'yolo' or 'confirm'
+        const chatJid = `tg:${ctx.chat.id}`;
+        if (this.opts.onTodoModeChange) {
+          await this.opts.onTodoModeChange(chatJid, mode, ctx);
+        }
+      } else if (data?.startsWith('todo:')) {
+        const [, action, proposalId] = data.split(':');
+        if (this.opts.onTodoCallback) {
+          await this.opts.onTodoCallback(proposalId, action, ctx);
+        }
       }
     });
 
@@ -325,6 +353,46 @@ export class TelegramChannel implements Channel {
       return msg.message_id.toString();
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send event proposal');
+      return undefined;
+    }
+  }
+
+  async sendTodoistProposal(jid: string, proposal: TodoistProposal): Promise<string | undefined> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return undefined;
+    }
+
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+
+      const PRIORITY_LABELS: Record<number, string> = { 1: 'normal', 2: 'low', 3: 'high', 4: 'urgent' };
+      const actionEmoji = proposal.action === 'create' ? '📋' : '✅';
+      let text = `${actionEmoji} *${proposal.content}*`;
+
+      if (proposal.action === 'create') {
+        if (proposal.due_string) text += `\nDue: ${proposal.due_string}`;
+        if (proposal.priority > 1) text += `\nPriority: ${PRIORITY_LABELS[proposal.priority] || proposal.priority}`;
+        if (proposal.project_name) text += `\nProject: ${proposal.project_name}`;
+        if (proposal.labels.length > 0) text += `\nLabels: ${proposal.labels.join(', ')}`;
+        if (proposal.description) text += `\n\n${proposal.description}`;
+      } else {
+        text += '\n_Mark as complete?_';
+      }
+
+      const actionLabel = proposal.action === 'create' ? '✅ Create' : '✅ Complete';
+      const keyboard = new InlineKeyboard()
+        .text(actionLabel, `todo:approve:${proposal.id}`)
+        .text('❌ Skip', `todo:skip:${proposal.id}`);
+
+      const msg = await this.bot.api.sendMessage(numericId, text, {
+        parse_mode: 'Markdown',
+        reply_markup: keyboard,
+      });
+
+      return msg.message_id.toString();
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to send todoist proposal');
       return undefined;
     }
   }
