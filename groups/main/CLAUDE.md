@@ -187,7 +187,9 @@ complete_todo(
 Parameters for `create_todo`:
 - `content` (required): Task title
 - `description` (optional): Additional details
-- `due_string` (optional): Natural language due date ("tomorrow", "Friday", "Mar 15")
+- `due_string` (optional): Natural language due date — supports both one-time and recurring:
+  - One-time: "tomorrow", "Friday", "Mar 15", "next Monday at 9am"
+  - Recurring: "every day", "every week", "every Monday", "every 2 weeks", "every month on the 15th", "every last Friday of the month", "every 3rd Tuesday starting Aug 29"
 - `project_name` (optional): Project name — resolved to ID automatically
 - `priority` (optional): 1=normal, 2=low, 3=high, 4=urgent
 - `labels` (optional): Array of label names
