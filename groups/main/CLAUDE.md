@@ -249,6 +249,8 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+**Learning from corrections:** When you discover you were wrong about a tool's capabilities — whether through web research, user correction, or trial and error — append the corrected fact to the `## Tool Notes` section at the bottom of this file. This section is auto-loaded on every invocation, so you'll never repeat the same mistake. Keep entries as short one-liners.
+
 ## Message Formatting
 
 Do NOT use markdown headings (##) in messages. Only use:
@@ -417,3 +419,11 @@ When scheduling tasks for other groups, use the `target_group_jid` parameter wit
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.
+
+---
+
+## Tool Notes
+
+Corrections and learnings discovered through usage. This section is auto-loaded — check here before making assumptions about tool capabilities.
+
+- **Todoist:** Recurring tasks work on the free plan. Use `due_string` with "every week", "every Monday", etc.
