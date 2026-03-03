@@ -1,3 +1,4 @@
+import os from 'os';
 import path from 'path';
 
 import { readEnvFile } from './env.js';
@@ -23,7 +24,7 @@ export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
-const HOME_DIR = process.env.HOME || '/Users/user';
+const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
 export const MOUNT_ALLOWLIST_PATH = path.join(
@@ -71,12 +72,12 @@ export const TRIGGER_PATTERN = new RegExp(
 export const TIMEZONE =
   process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone;
 
+// MTProto Reader configuration
+export const MTPROTO_API_ID = parseInt(envConfig.MTPROTO_API_ID || '', 10) || 0;
+export const MTPROTO_API_HASH = envConfig.MTPROTO_API_HASH || '';
+
 // Telegram configuration
 export const TELEGRAM_BOT_TOKEN =
   process.env.TELEGRAM_BOT_TOKEN || envConfig.TELEGRAM_BOT_TOKEN || '';
 export const TELEGRAM_ONLY =
   (process.env.TELEGRAM_ONLY || envConfig.TELEGRAM_ONLY) === 'true';
-
-// MTProto Reader configuration
-export const MTPROTO_API_ID = parseInt(envConfig.MTPROTO_API_ID || '', 10) || 0;
-export const MTPROTO_API_HASH = envConfig.MTPROTO_API_HASH || '';

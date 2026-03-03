@@ -64,7 +64,7 @@ export function startToolsProxy(): void {
 
   _server = server;
 
-  server.listen(PORT, '127.0.0.1', () => {
+  server.listen(PORT, '0.0.0.0', () => {
     logger.info({ port: PORT }, 'Tools proxy: HTTP server listening');
   });
 }
